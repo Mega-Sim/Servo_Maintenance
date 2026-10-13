@@ -1,0 +1,664 @@
+diff --git a/src/app/amc/amc_oht.cpp b/src/app/amc/amc_oht.cpp
+--- a/src/app/amc/amc_oht.cpp
++++ b/src/app/amc/amc_oht.cpp
+@@ -25,6 +25,7 @@
+ #include <unistd.h>
+ #include <cstring>
+ #include <sstream>
++#include <set>
+ #include <thread>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -221,12 +222,62 @@
+                     return axis >= 0 && axis < TOTAL_AXIS_NUM
+                         && motors[axis] != nullptr && oht_[axis] != nullptr;
+                 };
+-                // SDO 0x100A:0 (manufacturer software version), printable ASCII only.
+-                auto read_version = [this](int axis, std::string& version)
++                // Legacy RSA 2+1+1 is the default and is never re-addressed.
++                // Confirm the 4-axis profile with *both* EEPROM Product Code
++                // and four logical channels sharing the same physical bus index.
++                auto rsa_four_axis = [this, &valid_axis]() -> bool
++                {
++                    if (!valid_axis(0) || motors[0]->servo_vendor != ecvendor_rsa ||
++                        motors[0]->product_code != 0x02020033)
++                        return false;
++                    const int bus = motors[0]->bus_index;
++                    for (int i = 0; i < 4; ++i) {
++                        if (!valid_axis(i) || motors[i]->servo_vendor != ecvendor_rsa ||
++                            motors[i]->product_code != 0x02020033 ||
++                            motors[i]->bus_index != bus || motors[i]->module_num != i)
++                            return false;
++                    }
++                    return true;
++                };
++                const bool quad = rsa_four_axis();
++                // The LS iX7MA4444B Product Code is NOT present in the
++                // available controller sources/ESI; deliberately reject until
++                // the true EEPROM code is verified (do not invent one).
++#ifndef LS_IX7MA4444B_PRODUCT_CODE
++#define LS_IX7MA4444B_PRODUCT_CODE 0x00000000
++#endif
++                auto maintenance_model = [this, quad](int axis) -> const char*
++                {
++                    const auto* m = motors[axis];
++                    if (m->servo_vendor == ecvendor_rsa) {
++                        if (m->product_code == 0x02020033 && quad) return "RSA_4AXIS";
++                        if (m->product_code == 0x02020012 || m->product_code == 0x02020013)
++                            return "RSA_DUAL";
++                        if (m->product_code == 0x02010013) return "RSA_SINGLE";
++                        if (m->product_code == 0x02020002) return "RSA_TRIPLE";
++                        return "RSA_UNKNOWN_PRODUCT";
++                    }
++                    if (m->servo_vendor == ecvendor_yaskawa) {
++                        if (m->product_code == 0x02200901) return "YASKAWA_SIGMA7";
++                        if (m->product_code == 0x02200902) return "YASKAWA_DUAL";
++                        return "YASKAWA_UNKNOWN_PRODUCT";
++                    }
++                    if (m->servo_vendor == ecvendor_mecapion) {
++                        if (LS_IX7MA4444B_PRODUCT_CODE != 0 &&
++                            m->product_code == LS_IX7MA4444B_PRODUCT_CODE)
++                            return "LS_IX7MA4444B";
++                        return "LS_UNKNOWN_PRODUCT";
++                    }
++                    return "UNKNOWN_VENDOR";
++                };
++                // SDO 0x100A:0 is pack-level software version on the
++                // integrated RSA pack; use an absolute index to avoid 0x800
++                // legacy module translation. This does not claim a per-axis FW.
++                auto read_version = [this, quad](int axis, std::string& version)
+                 {
+                     char value[120] = {0,};
+                     int len = motors[axis]->coeSdoUpload(
+-                        0x100A, 0x0, reinterpret_cast<uint8_t*>(value), sizeof(value));
++                        0x100A, 0x0, reinterpret_cast<uint8_t*>(value), sizeof(value), quad);
+                     if (len > (int)sizeof(value))
+                         len = sizeof(value);
+                     version.clear();
+@@ -250,7 +301,11 @@
+                             out << " UNAVAILABLE\n";
+                             continue;
+                         }
+-                        out << " SERVO=" << (motors[i]->servo_vendor == ecvendor_rsa ? "RSA" : "OTHER")
++                        out << " SERVO=" << (motors[i]->servo_vendor == ecvendor_rsa ? "RSA" :
++                                                 motors[i]->servo_vendor == ecvendor_mecapion ? "LS_MECAPION" :
++                                                 motors[i]->servo_vendor == ecvendor_yaskawa ? "YASKAWA" : "OTHER")
++                            << " PROFILE=" << maintenance_model(i)
++                            << " PRODUCT=0x" << std::hex << motors[i]->product_code << std::dec
+                             << " ECAT=" << (motors[i]->initialized_ ? "CONNECTED" : "DISCONNECTED")
+                             << " SERVO_ON=" << (motors[i]->isEnabled() ? 1 : 0)
+                             << "\n";
+@@ -260,6 +315,21 @@
+                 else if (!valid_axis(axis))
+                 {
+                     result = "ERROR INVALID_AXIS\n";
++                }
++                else if (motors[axis]->servo_vendor == ecvendor_mecapion ||
++                         motors[axis]->servo_vendor == ecvendor_yaskawa)
++                {
++                    // Vendor-specific maintenance commands will be implemented later.
++                    result = std::string("ERROR NOT_IMPLEMENTED ") + maintenance_model(axis) + "\n";
++                }
++                else if (motors[axis]->servo_vendor == ecvendor_rsa &&
++                         !strcmp(maintenance_model(axis), "RSA_UNKNOWN_PRODUCT"))
++                {
++                    result = "ERROR UNSUPPORTED_RSA_PRODUCT\n";
++                }
++                else if (motors[axis]->servo_vendor != ecvendor_rsa)
++                {
++                    result = "ERROR UNSUPPORTED_SERVO\n";
+                 }
+                 else if (cmd == "ABS_RESET")
+                 {
+@@ -275,81 +345,109 @@
+                 }
+                 else if (cmd == "PARAM_UPDATE")
+                 {
+-                    result = oht_[axis]->UpdateServoParameter(filename.c_str())
++                    result = oht_[axis]->UpdateServoParameter(filename.c_str(), quad)
+                            ? "OK PARAM_UPDATE\n" : "ERROR PARAM_UPDATE\n";
+                 }
+                 else if (cmd == "PARAM_READ")
+                 {
+-                    // Line format: name,<unused>,index(hex),subindex|-,type
+                     FILE* fp = fopen(filename.c_str(), "r");
+                     if (!fp) {
+                         result = "ERROR PARAM_FILE\n";
+                     } else {
+                         std::ostringstream out;
+-                        out << "PARAM_READ Axis=" << axis << "\n";
+-
+-                        char line[256];
+-                        while (fgets(line, sizeof(line), fp))
+-                        {
++                        int total = 0, skipped = 0, succeeded = 0, failed = 0;
++                        std::set<uint32_t> seen;
++                        char line[512];
++                        const unsigned int wanted_group = static_cast<unsigned int>(2 + axis);
++                        while (fgets(line, sizeof(line), fp)) {
+                             char* name = strtok(line, ",");
+                             strtok(nullptr, ",");
+-                            char* idx  = strtok(nullptr, ",");
+-                            char* sub  = strtok(nullptr, ",");
+-                            char* type = strtok(nullptr, ", \r\n");  // type may be the last column
+-
+-                            if (!name || !idx || !sub || !type)
++                            char* idx = strtok(nullptr, ",");
++                            char* sub = strtok(nullptr, ",");
++                            char* type = strtok(nullptr, ", \r\n");
++                            if (!name || !idx || !sub || !type) {
++                                ++failed;
+                                 continue;
+-
+-                            uint16_t index = (uint16_t)strtol(idx, nullptr, 16);
+-                            uint16_t subindex = strcmp(sub, "-") ? (uint16_t)atoi(sub) : 0;
+-                            int len = -1;
+-
+-                            out << name << " [0x" << std::hex << index
+-                                << ":" << std::dec << subindex << "] = ";
+-
+-                            if (!strcmp(type, "USINT")) {
+-                                uint8_t v = 0;
+-                                len = motors[axis]->coeSdoUpload(index, subindex, &v, sizeof(v));
+-                                if (len > 0) out << (unsigned int)v;
+                             }
+-                            else if (!strcmp(type, "SINT")) {
+-                                int8_t v = 0;
+-                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
+-                                if (len > 0) out << (int)v;
++                            char* end = nullptr;
++                            const unsigned long raw_index = strtoul(idx, &end, 16);
++                            if (end == idx || *end || raw_index > 0xffff) {
++                                ++failed;
++                                continue;
+                             }
+-                            else if (!strcmp(type, "UINT")) {
+-                                uint16_t v = 0;
+-                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
+-                                if (len > 0) out << v;
++                            unsigned long raw_sub = 0;
++                            if (strcmp(sub, "-") != 0) {
++                                raw_sub = strtoul(sub, &end, 0);
++                                if (end == sub || *end || raw_sub > 255) {
++                                    ++failed;
++                                    continue;
++                                }
+                             }
+-                            else if (!strcmp(type, "INT")) {
+-                                int16_t v = 0;
+-                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
+-                                if (len > 0) out << v;
++                            const uint16_t index = static_cast<uint16_t>(raw_index);
++                            const uint16_t subindex = static_cast<uint16_t>(raw_sub);
++                            if (quad && ((index >> 12) != wanted_group)) {
++                                ++skipped;
++                                continue;
+                             }
+-                            else if (!strcmp(type, "UDINT")) {
+-                                uint32_t v = 0;
+-                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
+-                                if (len > 0) out << v;
++                            const uint32_t key = (static_cast<uint32_t>(index) << 8) | subindex;
++                            if (quad && !seen.insert(key).second) {
++                                ++skipped;
++                                continue;
+                             }
+-                            else if (!strcmp(type, "DINT")) {
+-                                int32_t v = 0;
+-                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
+-                                if (len > 0) out << v;
++                            int expected = 0;
++                            const bool negative = !strcmp(type, "SINT") ||
++                                !strcmp(type, "INT") || !strcmp(type, "DINT");
++                            if (!strcmp(type, "USINT") || !strcmp(type, "SINT")) expected = 1;
++                            else if (!strcmp(type, "UINT") || !strcmp(type, "INT")) expected = 2;
++                            else if (!strcmp(type, "UDINT") || !strcmp(type, "DINT")) expected = 4;
++                            ++total;
++                            // Always provide a full 4-byte numeric receive buffer.
++                            // Many drives return UINT/DINT despite an outdated CSV 'Type'.
++                            uint8_t data[4] = {};
++                            const int len = expected > 0
++                                ? motors[axis]->coeSdoUpload(index, subindex, data, sizeof(data), quad)
++                                : -1;
++                            out << name << " [0x" << std::hex << index << ":" << std::dec << subindex << "] = ";
++                            if (len == expected && expected > 0) {
++                                uint32_t value = 0;
++                                memcpy(&value, data, expected);
++                                if (negative) {
++                                    if (expected == 1) out << static_cast<int>(static_cast<int8_t>(value));
++                                    else if (expected == 2) out << static_cast<int16_t>(value);
++                                    else out << static_cast<int32_t>(value);
++                                } else out << value;
++                                ++succeeded;
++                            } else if (len > 0) {
++                                // No silent truncation; preserve original type discrepancy.
++                                out << "TYPE_MISMATCH expected=" << expected << " received=" << len;
++                                ++failed;
++                            } else {
++                                out << "READ_FAIL";
++                                ++failed;
+                             }
+-
+-                            if (len <= 0) out << "READ_FAIL";
+                             out << "\n";
+                         }
+-
+                         fclose(fp);
+-                        result = out.str();
++                        if (total == 0 && failed == 0)
++                            result = "ERROR PARAM_AXIS_NO_ENTRIES\n";
++                        else {
++                            std::ostringstream heading;
++                            heading << (failed ? "ERROR PARAM_READ Axis=" : "PARAM_READ Axis=") << axis
++                                    << " PROFILE=" << (quad ? "RSA_4AXIS" : "RSA_2_1_1")
++                                    << " TOTAL=" << total << " OK=" << succeeded
++                                    << " FAIL=" << failed << " SKIP=" << skipped << "\n";
++                            result = heading.str() + out.str();
++                        }
+                     }
+                 }
+                 else if (cmd == "FIRMWARE_UPDATE")
+                 {
+                     // Driving front/rear share one dual Servo Pack, so axis 1 is not a target.
+-                    if (axis == 1) {
++                    if (quad) {
++                        // The whole 4-axis pack shares one physical EtherCAT slave.
++                        // FoE package/target mapping requires separate validation.
++                        result = "ERROR FOE_4AXIS_NOT_VALIDATED\n";
++                    } else if (axis == 1) {
+                         result = "ERROR INVALID_FIRMWARE_TARGET\n";
+                     } else if (filename.empty()) {
+                         result = "ERROR FIRMWARE_FILE\n";
+diff --git a/src/control/axes_module.cpp b/src/control/axes_module.cpp
+--- a/src/control/axes_module.cpp
++++ b/src/control/axes_module.cpp
+@@ -28,6 +28,7 @@
+ #include <fstream>
+ #include <limits>
+ #include <sstream>
++#include <set>
+ #include <string>
+ #include <vector>
+ 
+@@ -385,7 +386,7 @@
+ 
+     // Reads the existing servo-tool CSV: name,param,index,subindex,type,value.
+     // Pre-parse the WHOLE file before any SDO write to reject malformed input.
+-    bool SingleAxis::UpdateServoParameter(const char* filename)
++    bool SingleAxis::UpdateServoParameter(const char* filename, bool rsa_quad_4axis)
+     {
+         if (motors_.empty() || !motors_[0] || filename == nullptr || !*filename)
+             return false;
+@@ -408,6 +409,7 @@
+             std::vector<uint8_t> bytes;
+         };
+         std::vector<ParameterEntry> entries;
++        std::set<uint32_t> seen_addresses;
+         std::string line;
+         unsigned int line_no = 0;
+ 
+@@ -445,6 +447,13 @@
+             if (errno || end == fields[2].c_str() || *end || raw_index > 0xFFFF) {
+                 SEP_LOGE("[ServoMaintenance] PARAM_UPDATE invalid index line=%u", line_no);
+                 return false;
++            }
++            // RSA 4-axis maintenance input uses absolute 0x2/3/4/5xxx
++            // addressing.  Never send another module's parameter to this axis.
++            if (rsa_quad_4axis) {
++                const uint16_t prefix = static_cast<uint16_t>(0x2000 + motor->module_num * 0x1000);
++                if (raw_index < prefix || raw_index >= prefix + 0x1000)
++                    continue;
+             }
+             unsigned long raw_subindex = 0;
+             if (fields[3] != "-") {
+@@ -491,6 +500,11 @@
+             const uint32_t encoded = static_cast<uint32_t>(parsed);
+             for (int i = 0; i < width; ++i)
+                 entry.bytes[static_cast<size_t>(i)] = static_cast<uint8_t>(encoded >> (i * 8));
++            if (rsa_quad_4axis) {
++                const uint32_t address = (static_cast<uint32_t>(entry.index) << 8) | entry.subindex;
++                if (!seen_addresses.insert(address).second)
++                    continue;
++            }
+             entries.push_back(entry);
+         }
+ 
+@@ -499,19 +513,34 @@
+             return false;
+         }
+ 
++        // RSA integrated 4-axis pack: validate actual data types BEFORE any write.
++        // Existing 2+1+1 parameter update semantics remain untouched.
++        if (rsa_quad_4axis) {
++            for (size_t i = 0; i < entries.size(); ++i) {
++                const ParameterEntry& entry = entries[i];
++                uint8_t probe[4] = {};
++                const int received = motor->coeSdoUpload(entry.index, entry.subindex,
++                                                          probe, sizeof(probe), true);
++                if (received != static_cast<int>(entry.bytes.size())) {
++                    SEP_LOGE("[ServoMaintenance] PARAM_UPDATE preflight SDO size mismatch index=0x%04x sub=%u expected=%zu received=%d",
++                             entry.index, entry.subindex, entry.bytes.size(), received);
++                    return false;
++                }
++            }
++        }
+         // The servo-tool's indexes already contain the RSA 0x2xxx/0x3xxx address.
+         // Do not add a second module offset to them.
+         for (size_t i = 0; i < entries.size(); ++i) {
+             const ParameterEntry& entry = entries[i];
+             if (!motor->coeSdoDownload(entry.index, entry.subindex,
+-                                       entry.bytes.data(), static_cast<int>(entry.bytes.size()))) {
++                                       entry.bytes.data(), static_cast<int>(entry.bytes.size()), rsa_quad_4axis)) {
+                 SEP_LOGE("[ServoMaintenance] PARAM_UPDATE write failed index=0x%04x sub=%u",
+                          entry.index, entry.subindex);
+                 return false;
+             }
+             std::vector<uint8_t> readback(entry.bytes.size(), 0);
+             const int received = motor->coeSdoUpload(entry.index, entry.subindex,
+-                                                      readback.data(), static_cast<int>(readback.size()));
++                                                      readback.data(), static_cast<int>(readback.size()), rsa_quad_4axis);
+             if (received != static_cast<int>(entry.bytes.size()) || readback != entry.bytes) {
+                 SEP_LOGE("[ServoMaintenance] PARAM_UPDATE readback mismatch index=0x%04x sub=%u",
+                          entry.index, entry.subindex);
+@@ -521,7 +550,7 @@
+ 
+         // Save manufacturer parameters only after every write/readback succeeds.
+         const uint8_t save[4] = {'s', 'a', 'v', 'e'};
+-        const bool saved = motor->coeSdoDownload(0x1010, 0x04, save, sizeof(save));
++        const bool saved = motor->coeSdoDownload(0x1010, 0x04, save, sizeof(save), rsa_quad_4axis);
+         if (!saved)
+             SEP_LOGE("[ServoMaintenance] PARAM_UPDATE save (0x1010:04) failed");
+         return saved;
+diff --git a/src/control/axes_module.h b/src/control/axes_module.h
+--- a/src/control/axes_module.h
++++ b/src/control/axes_module.h
+@@ -133,7 +133,7 @@
+         bool clearCommand();
+         bool resetEncoder(bool soft=false);
+         bool AbsoluteEncoderReset();
+-        bool UpdateServoParameter(const char* filename);
++        bool UpdateServoParameter(const char* filename, bool rsa_quad_4axis = false);
+         void setMotionChangeMode(bool immediate) { immediate_motion_change_ = immediate; }
+         bool isImmediateChangeMode() {return immediate_motion_change_; }
+ 
+diff --git a/src/control/ec_servo_motor.cpp b/src/control/ec_servo_motor.cpp
+--- a/src/control/ec_servo_motor.cpp
++++ b/src/control/ec_servo_motor.cpp
+@@ -43,6 +43,7 @@
+               initialized_(false), enabled_(false), emulation_mode_(ECAT_EMULATION_MODE), enc_offset_(0)
+     {
+         servo_vendor = 0;
++        product_code = 0;
+         servo_type_ = 0;
+     }
+ 
+@@ -95,6 +96,7 @@
+             servo_type_ = res.slave_type;
+             servo_vendor = res.servo_vendor;
+             module_num = res.servo_module_num;
++            product_code = res.product_code;
+             
+             SEP_LOGI("Servo Slave Info:  [axis_%d] vendor=%d\t type:%d\t bus_index:%d\t module_num:%d\n",axis, servo_vendor, servo_type_,bus_index,module_num);
+             
+@@ -177,13 +179,18 @@
+     }
+ 
+ 
+-    int EcServoMotor::coeSdoUpload(uint16_t index, uint16_t subindex, uint8_t* val, int len)
++    int EcServoMotor::coeSdoUpload(uint16_t index, uint16_t subindex, uint8_t* val, int len, bool absolute_index)
+     {
+         if (emulation_mode_) {
+             throw std::runtime_error("SDO upload is not supported under Emulation mode");
+         }
+ 
++        if (!val || len <= 0 || static_cast<size_t>(len) > EM_MSG_Q_DATA_SIZE) {
++            SEP_LOGE("[ServoMaintenance] Invalid SDO Upload buffer len=%d", len);
++            return -1;
++        }
+         ECatSdoMsg msg(ECatSdoMsg::SDO_UPLOAD, axis_no_);
++        msg.sdo.absolute_index = absolute_index ? 1 : 0;
+         msg.sdo.index = index;
+         msg.sdo.subindex = subindex;
+         msg.sdo.length  = len;
+@@ -195,17 +202,27 @@
+         SEP_REQUIRE_RET(msg_recvq_->get(res), -1);
+         SEP_REQUIRE_RET(res.command == res.RESPONSE_SDO_UPLOAD, -1);
+         SEP_REQUIRE_RET(res.result != -1, -1);
+-
++        if (res.sdo.length == 0 || res.sdo.length > static_cast<uint16_t>(len)
++            || res.sdo.length > sizeof(res.sdo.data)) {
++            SEP_LOGE("[ServoMaintenance] Invalid SDO Upload response len=%u capacity=%d",
++                     res.sdo.length, len);
++            return -1;
++        }
+         memcpy(val, res.sdo.data, res.sdo.length);
+         return res.sdo.length;
+     }
+ 
+-    bool EcServoMotor::coeSdoDownload(uint16_t index, uint16_t subindex, const uint8_t *val, int len)
++    bool EcServoMotor::coeSdoDownload(uint16_t index, uint16_t subindex, const uint8_t *val, int len, bool absolute_index)
+     {
+         if (emulation_mode_) {
+             throw std::runtime_error("SDO download is not supported under Emulation mode");
+         }
++        if (!val || len <= 0 || static_cast<size_t>(len) > EM_MSG_Q_DATA_SIZE) {
++            SEP_LOGE("[ServoMaintenance] Invalid SDO Download buffer len=%d", len);
++            return false;
++        }
+         ECatSdoMsg msg(ECatSdoMsg::SDO_DOWNLOAD, axis_no_);
++        msg.sdo.absolute_index = absolute_index ? 1 : 0;
+         msg.sdo.index = index;
+         msg.sdo.subindex = subindex;
+         msg.sdo.length  = len;
+diff --git a/src/control/ec_servo_motor.h b/src/control/ec_servo_motor.h
+--- a/src/control/ec_servo_motor.h
++++ b/src/control/ec_servo_motor.h
+@@ -123,6 +123,7 @@
+         int servo_vendor;
+         int bus_index;
+         int module_num;
++        uint32_t product_code;
+         int32_t enc_offset_;
+ 
+         // status 관리
+@@ -137,8 +138,8 @@
+         bool disableStatus;  // 210806 yjchoe, add disable flag
+     public:
+         // mail box 통신
+-        int coeSdoUpload(uint16_t index, uint16_t subindex, uint8_t* val, int len);
+-        bool coeSdoDownload(uint16_t index, uint16_t subindex, const uint8_t *val, int len);
++        int coeSdoUpload(uint16_t index, uint16_t subindex, uint8_t* val, int len, bool absolute_index = false);
++        bool coeSdoDownload(uint16_t index, uint16_t subindex, const uint8_t *val, int len, bool absolute_index = false);
+         friend class RoboticModule;
+     };
+ 
+diff --git a/src/ecmaster/ecmaster_message_handler.cpp b/src/ecmaster/ecmaster_message_handler.cpp
+--- a/src/ecmaster/ecmaster_message_handler.cpp
++++ b/src/ecmaster/ecmaster_message_handler.cpp
+@@ -148,6 +148,7 @@
+                 res.res.servo_module_num = slave.module_num;
+                 res.res.servo_vendor = slave.vendor_id;
+                 res.res.slave_type = slave.type;
++                res.res.product_code = slave.product_code;
+ 
+                 SEP_LOGI("slave %d is allocated to %d!\n", slave.slave_id, slave.user_pid );
+             } else {
+@@ -190,42 +191,72 @@
+     bool EcMasterSvc::handleSdoMessage(const ECatSdoMsg& msg)
+     {
+         ECatSdoMsg res(static_cast<ECatSdoMsg::Command>(msg.command + msg.RESPONSE), msg.slave_id);
++        if (msg.slave_id < 0 || msg.slave_id >= static_cast<int32_t>(slaves_.size())) {
++            SEP_LOGE("SDO request invalid slave=%d", msg.slave_id);
++            return false;
++        }
+         auto& slave = slaves_[msg.slave_id];
+-        int32_t index;
+-
+-        index = msg.sdo.index;   //CISmulti
+-	    
+-        int sdo_offset = 0x800;
+-	    if (slave.vendor_id == ecvendor_rsa){
+-	        if (msg.sdo.index >= 0x2000 && msg.sdo.index < 0x3000)
+-		        sdo_offset = 0x1000;
+-	    }
+-
+-        index = msg.sdo.index + slave.module_num * sdo_offset;
++        res.result = -1;
++        if (msg.sdo.length == 0 || msg.sdo.length > sizeof(msg.sdo.data)) {
++            SEP_LOGE("SDO invalid transfer length: slave=%d len=%u capacity=%zu",
++                     msg.slave_id, msg.sdo.length, sizeof(msg.sdo.data));
++            slave.msgq->put(res);
++            return false;
++        }
++        int32_t index = msg.sdo.index;
++        const bool rsa_quad = (slave.vendor_id == ecvendor_rsa &&
++                               slave.product_code == 0x02020033);
++        if (msg.sdo.absolute_index == 1) {
++            // Opt-in for maintenance only. Ordinary legacy PDO/SDO consumers retain
++            // the original module offset calculation without any behavior change.
++            const bool pack_level = (index == 0x100A || index == 0x1010);
++            const bool axis_level = (index >= 0x2000 && index < 0x6000 &&
++                 (static_cast<int>(index >> 12) - 2) == slave.module_num);
++            if (!rsa_quad || (!pack_level && !axis_level)) {
++                SEP_LOGE("SDO absolute index rejected: slave=%d vendor=0x%x product=0x%x module=%d index=0x%x",
++                         msg.slave_id, slave.vendor_id, slave.product_code, slave.module_num, index);
++                slave.msgq->put(res);
++                return false;
++            }
++        } else {
++            // Existing RSA 2+1+1/Yaskawa/LS module rules are NOT modified.
++            int sdo_offset = 0x800;
++            if (slave.vendor_id == ecvendor_rsa &&
++                msg.sdo.index >= 0x2000 && msg.sdo.index < 0x3000)
++                sdo_offset = 0x1000;
++            index += slave.module_num * sdo_offset;
++        }
+ 
+         if (msg.command == ECatSdoMsg::SDO_DOWNLOAD) {
+-            EC_T_DWORD data = ecatCoeSdoDownloadEx(slave.bus_index, index, msg.sdo.subindex,
+-                                 (uint8_t *)&msg.sdo.data, msg.sdo.length, msg.sdo.timeout, 0);
+-
+-            if (EC_E_NOERROR == data) {
++            const EC_T_DWORD error = ecatCoeSdoDownloadEx(
++                slave.bus_index, index, msg.sdo.subindex,
++                (uint8_t *)&msg.sdo.data, msg.sdo.length, msg.sdo.timeout, 0);
++            if (error == EC_E_NOERROR) {
+                 res.result = 0;
+             } else {
+-                SEP_LOGE("Fail to download sdo to slave %d: index = 0x%x, sub=%d\n", msg.slave_id, index, msg.sdo.subindex);
++                SEP_LOGE("SDO download failed slave=%d bus=%d module=%d src=0x%x tx=0x%x sub=%u len=%u code=0x%x",
++                         msg.slave_id, slave.bus_index, slave.module_num, msg.sdo.index,
++                         index, msg.sdo.subindex, msg.sdo.length, error);
++            }
++        } else if (msg.command == ECatSdoMsg::SDO_UPLOAD) {
++            EcDWord outlen = 0;
++            const EC_T_DWORD error = ecatCoeSdoUploadEx(
++                slave.bus_index, index, msg.sdo.subindex,
++                (uint8_t *)&res.sdo.data, msg.sdo.length, &outlen, msg.sdo.timeout, 0);
++            if (error == EC_E_NOERROR && outlen > 0 && outlen <= sizeof(res.sdo.data)
++                && outlen <= msg.sdo.length) {
++                res.sdo.length = static_cast<uint16_t>(outlen);
++                // Mark successful CoE read (res.result aliases sdo.timeout).
++                res.result = 0;
++            } else {
++                SEP_LOGE("SDO upload failed slave=%d bus=%d module=%d src=0x%x tx=0x%x sub=%u requested=%u received=%u code=0x%x",
++                         msg.slave_id, slave.bus_index, slave.module_num, msg.sdo.index,
++                         index, msg.sdo.subindex, msg.sdo.length, outlen, error);
+                 res.result = -1;
+             }
+-
+-        } else if (msg.command == ECatSdoMsg::SDO_UPLOAD) {
+-            EcDWord outlen;
+-            if (EC_E_NOERROR == ecatCoeSdoUploadEx(slave.bus_index, index, msg.sdo.subindex,
+-                                                 (uint8_t *)&res.sdo.data, msg.sdo.length, &outlen, msg.sdo.timeout, 0)){
+-                res.sdo.length = (uint16_t)outlen;
+-            } else {
+-                SEP_LOGE("Fail to upload sdo to slave %d\n", msg.slave_id);
+-                res.result = -1;
+-            }
+-
+-        } else {
+-            SEP_LOGE("Code should not reach here.\n");
++        } else {
++            SEP_LOGE("Unexpected SDO command=%u", msg.command);
++            slave.msgq->put(res);
+             return false;
+         }
+         slave.msgq->put(res);
+diff --git a/src/ecmaster/ecat_data_struct.h b/src/ecmaster/ecat_data_struct.h
+--- a/src/ecmaster/ecat_data_struct.h
++++ b/src/ecmaster/ecat_data_struct.h
+@@ -184,6 +184,7 @@
+             uint16_t subindex;  // coe subindex
+             uint16_t length;    // payload length
+             uint8_t data[EM_MSG_Q_DATA_SIZE]; // payload
++            uint16_t absolute_index; // 1: maintenance caller supplied an absolute CoE index
+         };
+         struct RscRequestMsg {
+             pid_t pid;
+@@ -196,6 +197,7 @@
+             uint32_t servo_module_num;
+             uint32_t servo_vendor;
+             uint32_t slave_type;
++            uint32_t product_code;
+             
+         };
+         struct FirmwareMsg {
+@@ -237,9 +239,9 @@
+         };
+ 
+     public:
+-        ECatSdoMsg(){sdo.timeout = COE_SDO_TIMEOUT_MS;}
+-        ECatSdoMsg(Command _command): command(_command){sdo.timeout = COE_SDO_TIMEOUT_MS;}
+-        ECatSdoMsg(Command _command, uint32_t _slave_id): command(_command), slave_id(_slave_id){sdo.timeout = COE_SDO_TIMEOUT_MS;}
++        ECatSdoMsg(){sdo.timeout = COE_SDO_TIMEOUT_MS; sdo.absolute_index = 0;}
++        ECatSdoMsg(Command _command): command(_command){sdo.timeout = COE_SDO_TIMEOUT_MS; sdo.absolute_index = 0;}
++        ECatSdoMsg(Command _command, uint32_t _slave_id): command(_command), slave_id(_slave_id){sdo.timeout = COE_SDO_TIMEOUT_MS; sdo.absolute_index = 0;}
+     };
+ 
+     // SERVO -> ATLAS
+diff --git a/src/ecmaster/ecmaster_config.h b/src/ecmaster/ecmaster_config.h
+--- a/src/ecmaster/ecmaster_config.h
++++ b/src/ecmaster/ecmaster_config.h
+@@ -29,7 +29,7 @@
+     enum ECatContants {
+         EM_MSG_Q_SIZE           = 512,
+         EM_SLAVE_MSG_Q_SIZE     = 16,
+-        EM_MSG_Q_DATA_SIZE      = 16,
++        EM_MSG_Q_DATA_SIZE      = 128,
+         EM_SHM_SECTION_SIZE     = 4096*10,
+         EM_SHM_SIZE             = EM_SHM_SECTION_SIZE * 3, // in/out/share
+         EM_RPC_PORT             = 50051,
+diff --git a/src/ecmaster/rpc/ecmaster.proto b/src/ecmaster/rpc/ecmaster.proto
+--- a/src/ecmaster/rpc/ecmaster.proto
++++ b/src/ecmaster/rpc/ecmaster.proto
+@@ -72,6 +72,7 @@
+     uint32 servo_module_num = 6;
+     uint32 servo_vendor = 7;
+     uint32 slave_type = 8;
++    uint32 product_code = 9;
+ }
+ 
+ message AdminCommand {
+diff --git a/src/ecmaster/ecmaster_admin.cpp b/src/ecmaster/ecmaster_admin.cpp
+--- a/src/ecmaster/ecmaster_admin.cpp
++++ b/src/ecmaster/ecmaster_admin.cpp
+@@ -68,6 +68,7 @@
+             reply->set_servo_module_num(res.res.servo_module_num);
+             reply->set_servo_vendor(res.res.servo_vendor);
+             reply->set_slave_type(res.res.slave_type);
++            reply->set_product_code(res.res.product_code);
+             return Status::OK;
+         }
+ 
+diff --git a/src/ecmaster/ecmaster_rpc_client.h b/src/ecmaster/ecmaster_rpc_client.h
+--- a/src/ecmaster/ecmaster_rpc_client.h
++++ b/src/ecmaster/ecmaster_rpc_client.h
+@@ -59,6 +59,7 @@
+                 res.servo_module_num = reply.servo_module_num();
+                 res.servo_vendor = reply.servo_vendor();
+                 res.slave_type = reply.slave_type();
++                res.product_code = reply.product_code();
+             } else {
+                 res.in_pd_offset = 0xFFFFFFFF;
+                 res.out_pd_offset = 0xFFFFFFFF;

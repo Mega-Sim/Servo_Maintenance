@@ -82,3 +82,8 @@ make -j2
 - 패치 기계적 적용(`git apply --check`) 및 패치 내용 일치 확인 완료.
 - 제품 코드/4축 Index 규칙의 정적 테스트 수행.
 - **실제 OHT 빌드 및 EtherCAT 서보팩 통신 시험 미실시** (현재 실행 환경에 Controller의 Acontis/gRPC SDK와 `protoc`가 없음).
+## 브랜치에서 직접 수정 소스 가져오기
+
+현재 브랜치의 `controller_patch/src/`에는 **0005+0005b+0006 반영 수정 11개 파일**이 개별 원본 형태로도 저장돼 있다. 이미 이 소스를 복사해서 적용할 경우 `0005b`, `0006`을 **다시 적용하지 말 것**(중복 변경). `controller_patch/src/`의 기존 EC-Master FoE 관련 파일도 유지돼 있다.
+
+유지보수 명령의 신규 처리 함수는 AMC에 있고, EC-Master는 기존 CoE 전달을 이용한다. 신규 모델 분기와 Product Code 전달은 `ecmaster.proto` 응답 필드 추가가 필요하므로 빌드 전에 `protoc` 재생성이 필수다.

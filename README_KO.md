@@ -103,6 +103,9 @@ Windows가 담당하지 않는 일:
 - 최신 유지보수 UI 제공
 - IE 호환성을 고려한 XMLHttpRequest와 HTML form 사용
 - 요청을 Bridge의 내부 TCP 프로토콜로 변환
+- 다른 사이트에서 보낸 POST 차단: `Origin`이 다르면 거부하고, 엔코더 리셋은 `application/json` 요청만 받음
+- 파일 업로드는 자체 multipart 파서로 처리 (Python 3.13에서 제거된 `cgi` 모듈을 사용하지 않음)
+- 업로드 결과는 숨은 iframe으로 받으므로, IE 기본 오류 페이지가 결과를 가리지 않도록 HTTP 200과 JSON `ok` 값으로 응답
 
 ### Linux Bridge
 
@@ -116,25 +119,26 @@ Windows가 담당하지 않는 일:
 - 파일 크기 제한
 - 파일 저장 및 덮어쓰기 방지
 - AMC UNIX socket 명령 전달
-- 한 번에 하나의 유지보수 명령만 실행하도록 직렬화
+- 한 번에 하나의 유지보수 명령만 실행: 실행 중에 들어온 요청은 기다리지 않고 `another maintenance operation is running`으로 즉시 거부 (펌웨어 업데이트 중 화면이 멈춘 것처럼 보이는 문제 방지)
 
 Bridge는 EtherCAT 라이브러리를 직접 호출하지 않습니다. 또한 별도의 외부 펌웨어 실행 프로그램을 생성하지 않습니다.
 
 ### AMC
 
-AMC는 기존 `amc_oht` 유지보수 UNIX socket을 통해 명령을 받습니다.
-
-기존 기능:
+AMC는 `amc_oht` 유지보수 UNIX socket(`/tmp/amc_rsa_maintenance.sock`)으로 명령을 받습니다.
+이 socket 수신 스레드와 아래 명령 처리는 모두 `0005` diff가 `amc_oht.cpp`에 추가하는 코드입니다.
 
 - `STATUS`
 - `FW_VERSION <axis>`
 - `ABS_RESET <axis>`
 - `PARAM_READ <axis> <path>`
 - `PARAM_UPDATE <axis> <path>`
-
-추가 기능:
-
 - `FIRMWARE_UPDATE <axis> <path>`
+
+> `ABS_RESET`과 `PARAM_UPDATE`는 원본 Controller 소스의 `AbsoluteEncoderReset()`, `UpdateServoParameter()`를 호출합니다.
+> 이 두 함수는 diff에 포함되어 있지 않으므로, 적용 대상 원본 소스에 있어야 빌드됩니다.
+>
+> socket 권한은 `0600`입니다. Bridge(systemd `User=semes`)와 AMC가 **같은 Linux 사용자**로 실행되어야 접속할 수 있습니다.
 
 AMC는 파일 자체를 EtherCAT으로 전송하지 않습니다. AxisModule과 EcServoMotor를 통해 EC-Master에 작업을 요청합니다.
 
@@ -485,6 +489,9 @@ http://192.168.0.2:18765/
 | AMC CONNECTED 실패 | AMC 실행 여부와 UNIX socket 수신 스레드 확인 |
 | FW_VERSION 실패 | Controller diff 적용 후 AMC 재빌드 여부 확인 |
 | FIRMWARE_UPDATE 파일 오류 | 파일 확장자, 파일 크기, 저장 경로, 동일 파일명 내용 확인 |
+| another maintenance operation is running | 다른 작업(특히 펌웨어 업데이트)이 끝난 뒤 다시 실행 |
+| cross-site request is not allowed | 바로가기(`http://192.168.0.2:18765/`)로 연 화면에서만 실행 |
+| AMC socket Permission denied | AMC와 Bridge 실행 사용자가 같은지 확인 (socket 권한 `0600`) |
 | Bus configuration mismatch | EtherCAT Slave 연결, XML/YML 설정, 실제 장치 구성을 확인 |
 | FoE 실패 | Servo Pack 지원 여부, Bootstrap 상태 전환, 펌웨어 호환성, EC-Master 로그 확인 |
 | 업데이트 후 OP 복귀 실패 | reset SDO 결과와 Servo Pack 전원·네트워크 상태 확인 |
@@ -569,6 +576,11 @@ patch --dry-run -p1 -d /home/semes/work/master_control \
 - 외부 펌웨어 실행 프로세스 미사용
 - EC-Master FoE 소스 계약
 - Controller diff와 전체 변경 파일 일치
+- 실행 중 요청 즉시 거부, `True` 같은 bool 축 값 거부, 한글 토큰 처리
+- Windows 전체 경로 파일명을 기본 이름으로 저장
+- 다른 사이트 POST 차단과 펌웨어 바이너리 multipart 무손실 전달
+
+지원 Python: 3.5 이상 (3.13 포함). 3.11과 3.13에서 테스트를 실행했습니다.
 
 실제 Servo Pack에 대한 FoE 전송과 전체 Controller 바이너리 빌드는 장비와 현장 빌드 의존성이 필요하므로, 검증 장비에서 별도로 수행해야 합니다.
 

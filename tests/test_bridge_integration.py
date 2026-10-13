@@ -167,3 +167,60 @@ class MaintenanceBridgeTests(unittest.TestCase):
             server.server_close()
             worker.join(timeout=2)
 
+
+
+class BridgeSafetyTests(unittest.TestCase):
+    def make_bridge(self, command_sender):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        config = BridgeConfig(
+            shared_token="test-token",
+            allowed_client_ip="127.0.0.1",
+            unix_socket="/tmp/unused.sock",
+            spool_dir=self.temp.name,
+        )
+        return MaintenanceBridge(config, command_sender=command_sender)
+
+    def header(self, **values):
+        header = {"protocol": "SMT1", "token": "test-token", "command": "status", "axis": -1, "payload_length": 0}
+        header.update(values)
+        return header
+
+    def test_second_request_is_rejected_while_one_is_running(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_sender(command):
+            started.set()
+            release.wait(2)
+            return "AMC CONNECTED\n"
+
+        bridge = self.make_bridge(slow_sender)
+        worker = threading.Thread(target=bridge.handle_request, args=(self.header(), b"", "127.0.0.1"))
+        worker.start()
+        self.assertTrue(started.wait(2))
+        busy = bridge.handle_request(self.header(), b"", "127.0.0.1")
+        release.set()
+        worker.join(2)
+        self.assertFalse(busy["ok"])
+        self.assertIn("another maintenance operation", busy["message"])
+
+    def test_boolean_axis_and_non_ascii_token_are_rejected(self):
+        commands = []
+        bridge = self.make_bridge(lambda command: commands.append(command) or "OK")
+        as_bool = bridge.handle_request(self.header(command="absolute_reset", axis=True), b"", "127.0.0.1")
+        korean = bridge.handle_request(self.header(token="토큰"), b"", "127.0.0.1")
+        self.assertIn("axis", as_bool["message"])
+        self.assertIn("authentication", korean["message"])
+        self.assertEqual(commands, [])
+
+    def test_windows_full_path_is_stored_by_base_name(self):
+        commands = []
+        bridge = self.make_bridge(lambda command: commands.append(command) or "PARAM_READ Axis=1\n")
+        response = bridge.handle_request(
+            self.header(command="parameter_read", axis=1, payload_length=3, filename="C:\\work\\gain.txt"),
+            b"abc",
+            "127.0.0.1",
+        )
+        self.assertTrue(response["ok"])
+        self.assertEqual(commands, ["PARAM_READ 1 {}".format(Path(self.temp.name) / "gain.txt")])

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Authenticated loopback bridge from the Linux web UI to AMC maintenance."""
+"""Authenticated loopback bridge from the Linux web UI to the AMC maintenance socket."""
 
 import argparse
 import configparser
 import hmac
-import json
 import logging
 import os
 import re
@@ -21,48 +20,43 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from common.maintenance_protocol import (  # noqa: E402
-    DEFAULT_MAX_FIRMWARE_BYTES,
     DEFAULT_MAX_FILE_BYTES,
-    FIRMWARE_CONFIRMATION,
+    DEFAULT_MAX_FIRMWARE_BYTES,
+    FILE_COMMANDS,
+    FIRMWARE_TARGETS,
     HEADER_MAX_BYTES,
     PROTOCOL_NAME,
     ProtocolError,
     decode_json,
+    encode_json,
     recv_exact,
     recv_frame,
     send_frame,
+    validate_client_request,
 )
 
 
 LOG = logging.getLogger("servo_maintenance_tcp_bridge")
-PLACEHOLDER_TOKENS = {"", "CHANGE_ME", "CHANGE_ME_TO_A_LONG_RANDOM_TOKEN"}
-ALLOWED_COMMANDS = {
-    "status": "STATUS",
-    "firmware_version": "FW_VERSION {axis}",
-    "absolute_reset": "ABS_RESET {axis}",
-}
-FILE_COMMANDS = {
-    "parameter_read": "PARAM_READ {axis} {path}",
-    "parameter_update": "PARAM_UPDATE {axis} {path}",
-}
-FIRMWARE_COMMAND = "FIRMWARE_UPDATE {axis} {path}"
-SUCCESS_PREFIXES = {
-    "status": "AMC CONNECTED",
-    "firmware_version": "FW_VERSION Axis=",
-    "absolute_reset": "OK ABS_RESET",
-    "parameter_read": "PARAM_READ Axis=",
-    "parameter_update": "OK PARAM_UPDATE",
-    "firmware_update": "OK FIRMWARE_UPDATE",
+PLACEHOLDER_TOKENS = ("", "CHANGE_ME", "CHANGE_ME_TO_A_LONG_RANDOM_TOKEN")
+DEFAULT_SPOOL_DIR = "/home/semes/work/bin"  # EC-Master only accepts firmware below this path.
+SAFE_FILENAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+# Web command -> (AMC UNIX socket command, prefix of a successful AMC reply)
+AMC_COMMANDS = {
+    "status": ("STATUS", "AMC CONNECTED"),
+    "firmware_version": ("FW_VERSION {axis}", "FW_VERSION Axis="),
+    "absolute_reset": ("ABS_RESET {axis}", "OK ABS_RESET"),
+    "parameter_read": ("PARAM_READ {axis} {path}", "PARAM_READ Axis="),
+    "parameter_update": ("PARAM_UPDATE {axis} {path}", "OK PARAM_UPDATE"),
+    "firmware_update": ("FIRMWARE_UPDATE {axis} {path}", "OK FIRMWARE_UPDATE"),
 }
 
 
 class RequestRejected(Exception):
-    """Expected request rejection that can be returned safely to the client."""
+    """Expected rejection whose message is safe to return to the client."""
 
 
 class BridgeConfig:
-    """Bridge settings kept compatible with Python 3.5 and newer."""
-
     def __init__(
         self,
         shared_token,
@@ -71,7 +65,7 @@ class BridgeConfig:
         spool_dir,
         max_file_bytes=DEFAULT_MAX_FILE_BYTES,
         unix_timeout_seconds=120.0,
-        listen_host="0.0.0.0",
+        listen_host="127.0.0.1",
         listen_port=18766,
         firmware_max_file_bytes=DEFAULT_MAX_FIRMWARE_BYTES,
         firmware_targets=None,
@@ -80,63 +74,73 @@ class BridgeConfig:
         self.allowed_client_ip = allowed_client_ip
         self.unix_socket = unix_socket
         self.spool_dir = spool_dir
-        self.max_file_bytes = max_file_bytes
-        self.unix_timeout_seconds = unix_timeout_seconds
+        self.max_file_bytes = int(max_file_bytes)
+        self.unix_timeout_seconds = float(unix_timeout_seconds)
         self.listen_host = listen_host
-        self.listen_port = listen_port
+        self.listen_port = int(listen_port)
         self.firmware_max_file_bytes = int(firmware_max_file_bytes)
         self.firmware_targets = firmware_targets or {"driving": 0, "hoist": 2, "slide": 3}
 
     def validate(self):
         if self.shared_token in PLACEHOLDER_TOKENS or len(self.shared_token) < 16:
-            raise ValueError("shared_token must be set to a non-placeholder value of at least 16 characters")
+            raise ValueError("shared_token must be a non-placeholder value of at least 16 characters")
         if not self.allowed_client_ip:
             raise ValueError("allowed_client_ip must be configured")
         if not self.unix_socket.startswith("/"):
             raise ValueError("unix_socket must be an absolute path")
-        if self.max_file_bytes < 1 or self.max_file_bytes > 16 * 1024 * 1024:
+        if not 1 <= self.max_file_bytes <= 16 * 1024 * 1024:
             raise ValueError("max_file_bytes must be between 1 and 16777216")
-        if self.listen_port < 1 or self.listen_port > 65535:
+        if not 1 <= self.firmware_max_file_bytes <= DEFAULT_MAX_FIRMWARE_BYTES:
+            raise ValueError("firmware max_file_bytes must be between 1 and 8388608")
+        if not 1 <= self.listen_port <= 65535:
             raise ValueError("listen_port must be between 1 and 65535")
-        if self.firmware_max_file_bytes < 1 or self.firmware_max_file_bytes > 8 * 1024 * 1024:
-            raise ValueError("firmware_max_file_bytes must be between 1 and 8388608")
-        if set(self.firmware_targets) != {"driving", "hoist", "slide"}:
+        if sorted(self.firmware_targets) != sorted(FIRMWARE_TARGETS):
             raise ValueError("firmware targets must be driving, hoist, and slide")
-        if any(not isinstance(value, int) or value < 0 or value > 3 for value in self.firmware_targets.values()):
-            raise ValueError("firmware target axes must be integers from 0 to 3")
+        for axis in self.firmware_targets.values():
+            if type(axis) is not int or not 0 <= axis <= 3:
+                raise ValueError("firmware target axes must be integers from 0 to 3")
 
 
 def load_config(path):
     parser = configparser.ConfigParser()
-    loaded = parser.read(path, encoding="utf-8")
-    if not loaded or "server" not in parser:
+    if not parser.read(str(path), encoding="utf-8") or not parser.has_section("server"):
         raise ValueError("configuration file or [server] section not found: {}".format(path))
-    server = parser["server"]
-    firmware = parser["firmware"] if "firmware" in parser else {}
+
+    def text(option, default):
+        return parser.get("server", option, fallback=default).strip()
+
     config = BridgeConfig(
-        shared_token=server.get("shared_token", "").strip(),
-        allowed_client_ip=server.get("allowed_client_ip", "").strip(),
-        unix_socket=server.get("unix_socket", "/tmp/amc_rsa_maintenance.sock").strip(),
-        spool_dir=server.get("spool_dir", "/tmp/servo_maintenance_uploads").strip(),
-        max_file_bytes=server.getint("max_file_bytes", fallback=DEFAULT_MAX_FILE_BYTES),
-        unix_timeout_seconds=server.getfloat("unix_timeout_seconds", fallback=120.0),
-        listen_host=server.get("listen_host", "0.0.0.0").strip(),
-        listen_port=server.getint("listen_port", fallback=18766),
-        firmware_max_file_bytes=firmware.getint(
-            "max_file_bytes", fallback=DEFAULT_MAX_FIRMWARE_BYTES
-        ) if firmware else DEFAULT_MAX_FIRMWARE_BYTES,
+        shared_token=text("shared_token", ""),
+        allowed_client_ip=text("allowed_client_ip", ""),
+        unix_socket=text("unix_socket", "/tmp/amc_rsa_maintenance.sock"),
+        spool_dir=text("spool_dir", DEFAULT_SPOOL_DIR),
+        max_file_bytes=parser.getint("server", "max_file_bytes", fallback=DEFAULT_MAX_FILE_BYTES),
+        unix_timeout_seconds=parser.getfloat("server", "unix_timeout_seconds", fallback=120.0),
+        listen_host=text("listen_host", "127.0.0.1"),
+        listen_port=parser.getint("server", "listen_port", fallback=18766),
+        firmware_max_file_bytes=parser.getint(
+            "firmware", "max_file_bytes", fallback=DEFAULT_MAX_FIRMWARE_BYTES
+        ),
         firmware_targets={
-            "driving": firmware.getint("driving_axis", fallback=0) if firmware else 0,
-            "hoist": firmware.getint("hoist_axis", fallback=2) if firmware else 2,
-            "slide": firmware.getint("slide_axis", fallback=3) if firmware else 3,
+            "driving": parser.getint("firmware", "driving_axis", fallback=0),
+            "hoist": parser.getint("firmware", "hoist_axis", fallback=2),
+            "slide": parser.getint("firmware", "slide_axis", fallback=3),
         },
     )
     config.validate()
     return config
 
 
+def safe_filename(filename):
+    """Keep only the base name (IE may send a full Windows path) and allow plain characters."""
+    basename = filename.replace("\\", "/").split("/")[-1]
+    if basename in ("", ".", "..") or not SAFE_FILENAME.match(basename):
+        raise RequestRejected("file name may only contain A-Z, a-z, 0-9, '.', '_', '-' (max 128)")
+    return basename
+
+
 class MaintenanceBridge:
-    """Validates a TCP request then invokes exactly one local AMC command."""
+    """Validates one request and runs exactly one AMC command at a time."""
 
     def __init__(self, config, command_sender=None):
         self.config = config
@@ -145,169 +149,128 @@ class MaintenanceBridge:
 
     def handle_request(self, header, payload, peer_ip):
         try:
-            command, axis, target = self._validate_request(header, payload, peer_ip)
-            with self._operation_lock:
-                return self._execute(command, axis, target, header.get("filename", ""), payload)
+            self._validate(header, payload, peer_ip)
+        except (RequestRejected, ValueError) as error:
+            return {"ok": False, "message": "ERROR: {}".format(error)}
+
+        # A firmware update can take minutes.  Answer other requests at once instead of
+        # letting them wait in the queue until the web UI times out.
+        if not self._operation_lock.acquire(False):
+            return {"ok": False, "message": "ERROR: another maintenance operation is running"}
+        try:
+            return self._execute(header, payload)
         except RequestRejected as error:
             return {"ok": False, "message": "ERROR: {}".format(error)}
         except OSError as error:
             LOG.exception("controller socket failure")
             return {"ok": False, "message": "ERROR: controller socket failure: {}".format(error)}
-        except Exception as error:  # Keep TCP worker alive while reporting unexpected failures.
+        except Exception as error:  # Keep the TCP worker alive and report the failure.
             LOG.exception("unexpected maintenance bridge failure")
             return {"ok": False, "message": "ERROR: bridge failure: {}".format(error)}
+        finally:
+            self._operation_lock.release()
 
-    def _validate_request(self, header, payload, peer_ip):
-        if not isinstance(header, dict):
-            raise RequestRejected("request header must be a JSON object")
+    def _validate(self, header, payload, peer_ip):
         if header.get("protocol") != PROTOCOL_NAME:
             raise RequestRejected("unsupported protocol")
         token = header.get("token")
-        if not isinstance(token, str) or not hmac.compare_digest(token, self.config.shared_token):
+        # Compare bytes: compare_digest raises TypeError for non-ASCII str.
+        expected = self.config.shared_token.encode("utf-8")
+        if not isinstance(token, str) or not hmac.compare_digest(token.encode("utf-8"), expected):
             raise RequestRejected("authentication failed")
-        if self.config.allowed_client_ip != "*" and peer_ip != self.config.allowed_client_ip:
+        if self.config.allowed_client_ip not in ("*", peer_ip):
             raise RequestRejected("client IP is not allowed")
+        if header.get("payload_length") != len(payload):
+            raise RequestRejected("payload length does not match header")
 
         command = header.get("command")
-        if command not in set(ALLOWED_COMMANDS) | set(FILE_COMMANDS) | {"firmware_update"}:
-            raise RequestRejected("unsupported command")
-        payload_length = header.get("payload_length")
-        if not isinstance(payload_length, int) or payload_length < 0:
-            raise RequestRejected("payload_length must be a non-negative integer")
-        if payload_length != len(payload):
-            raise RequestRejected("payload length does not match header")
-        request_limit = (
-            self.config.firmware_max_file_bytes if command == "firmware_update" else self.config.max_file_bytes
+        validate_client_request(
+            command,
+            header.get("axis"),
+            payload,
+            header.get("filename", ""),
+            self.config.max_file_bytes,
+            header.get("target", ""),
+            header.get("confirmation", ""),
+            self.config.firmware_max_file_bytes,
         )
-        if payload_length > request_limit:
-            raise RequestRejected("uploaded file exceeds configured size limit")
-
-        axis = header.get("axis")
-        if command == "status":
-            if axis != -1 or payload:
-                raise RequestRejected("status requires axis -1 and no payload")
-            return command, axis, ""
-        if command == "firmware_update":
-            if axis != -1:
-                raise RequestRejected("firmware_update requires axis -1")
-            target = header.get("target")
-            if target not in self.config.firmware_targets:
-                raise RequestRejected("firmware target is not configured")
-            if header.get("confirmation") != FIRMWARE_CONFIRMATION:
-                raise RequestRejected("firmware confirmation is invalid")
-            filename = header.get("filename")
-            if not isinstance(filename, str) or not filename.lower().endswith(".bin"):
-                raise RequestRejected("firmware filename must end with .bin")
-            if not payload:
-                raise RequestRejected("firmware file payload is empty")
-            self._safe_filename(filename)
-            return command, axis, target
-        if not isinstance(axis, int) or axis < 0 or axis > 3:
-            raise RequestRejected("axis must be an integer from 0 to 3")
         if command in FILE_COMMANDS:
-            filename = header.get("filename")
-            if not isinstance(filename, str) or not filename:
-                raise RequestRejected("parameter command requires a filename")
-            if not payload:
-                raise RequestRejected("parameter file payload is empty")
-        elif payload:
-            raise RequestRejected("payload is only valid for parameter commands")
-        return command, axis, ""
+            safe_filename(header["filename"])
 
-    def _execute(self, command, axis, target, filename, payload):
+    def _execute(self, header, payload):
+        command = header["command"]
+        axis = header["axis"]
+        path = ""
+        if command in FILE_COMMANDS:
+            path = self._save_uploaded_file(header["filename"], payload)
         if command == "firmware_update":
-            stored_path = self._save_uploaded_file(filename, payload)
-            firmware_axis = self.config.firmware_targets[target]
-            result = self._command_sender(
-                FIRMWARE_COMMAND.format(axis=firmware_axis, path=stored_path)
-            )
-        elif command in FILE_COMMANDS:
-            stored_path = self._save_uploaded_file(filename, payload)
-            unix_command = FILE_COMMANDS[command].format(axis=axis, path=stored_path)
-            result = self._command_sender(unix_command)
-        else:
-            unix_command = ALLOWED_COMMANDS[command].format(axis=axis)
-            result = self._command_sender(unix_command)
-        ok = result.startswith(SUCCESS_PREFIXES[command])
-        return {"ok": ok, "message": result}
+            axis = self.config.firmware_targets[header["target"]]
+
+        amc_command, success_prefix = AMC_COMMANDS[command]
+        result = self._command_sender(amc_command.format(axis=axis, path=path))
+        return {"ok": result.startswith(success_prefix), "message": result}
 
     def _save_uploaded_file(self, filename, payload):
-        safe_name = self._safe_filename(filename)
+        """Store under spool_dir with the original name.  Never overwrite different content."""
+        name = safe_filename(filename)
         spool = Path(self.config.spool_dir)
         spool.mkdir(mode=0o700, parents=True, exist_ok=True)
-        destination = spool / safe_name
+        destination = spool / name
         if destination.exists():
             if destination.is_file() and destination.read_bytes() == payload:
                 return str(destination)
-            raise RequestRejected("uploaded file already exists with different content: {}".format(safe_name))
-        with tempfile.NamedTemporaryFile(
-            mode="wb", prefix=".servo_upload_", dir=str(spool), delete=False
-        ) as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-            temporary_path = handle.name
+            raise RequestRejected("uploaded file already exists with different content: {}".format(name))
+
+        handle, temporary_path = tempfile.mkstemp(prefix=".servo_upload_", dir=str(spool))
         try:
+            with os.fdopen(handle, "wb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
             os.chmod(temporary_path, 0o600)
             os.replace(temporary_path, str(destination))
         except Exception:
-            try:
+            if os.path.exists(temporary_path):
                 os.unlink(temporary_path)
-            except OSError:
-                pass
             raise
         return str(destination)
 
-    @staticmethod
-    def _safe_filename(filename):
-        basename = os.path.basename(filename.replace("\\", "/"))
-        if not basename or basename in {".", ".."}:
-            raise RequestRejected("invalid parameter filename")
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", basename):
-            raise RequestRejected("parameter filename contains unsupported characters")
-        return basename
-
     def _send_unix_command(self, command):
-        if len(command.encode("utf-8")) >= 1024:
+        data = command.encode("utf-8")
+        if len(data) >= 1024:  # AMC reads one 1024-byte buffer.
             raise RequestRejected("controller command is too long")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unix_sock:
             unix_sock.settimeout(self.config.unix_timeout_seconds)
             unix_sock.connect(self.config.unix_socket)
-            unix_sock.sendall(command.encode("utf-8"))
+            unix_sock.sendall(data)
             unix_sock.shutdown(socket.SHUT_WR)
-            chunks = []
+            reply = bytearray()
             while True:
                 chunk = unix_sock.recv(4096)
                 if not chunk:
                     break
-                chunks.append(chunk)
-        if not chunks:
+                reply += chunk
+        if not reply:
             raise RequestRejected("controller returned no response")
-        return b"".join(chunks).decode("utf-8", errors="replace")
+        return reply.decode("utf-8", errors="replace")
 
 
 class BridgeRequestHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        response = None
+        config = self.server.bridge.config
         try:
             header = decode_json(recv_frame(self.request, HEADER_MAX_BYTES), "request header")
-            payload_length = header.get("payload_length")
-            if not isinstance(payload_length, int) or payload_length < 0:
-                raise ProtocolError("payload_length must be a non-negative integer")
-            max_payload = max(
-                self.server.bridge.config.max_file_bytes,
-                self.server.bridge.config.firmware_max_file_bytes,
-            )
-            if payload_length > max_payload:
-                raise ProtocolError("payload too large")
-            payload = recv_exact(self.request, payload_length)
+            length = header.get("payload_length")
+            if type(length) is not int or not 0 <= length <= max(config.max_file_bytes, config.firmware_max_file_bytes):
+                raise ProtocolError("payload_length is invalid or too large")
+            payload = recv_exact(self.request, length)
             response = self.server.bridge.handle_request(header, payload, self.client_address[0])
-        except (ProtocolError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        except ProtocolError as error:
             response = {"ok": False, "message": "ERROR: invalid request: {}".format(error)}
         except OSError as error:
             response = {"ok": False, "message": "ERROR: network failure: {}".format(error)}
         try:
-            send_frame(self.request, json.dumps(response, ensure_ascii=False).encode("utf-8"))
+            send_frame(self.request, encode_json(response))
         except OSError:
             LOG.warning("response could not be sent to %s", self.client_address[0])
 
@@ -318,29 +281,28 @@ class BridgeTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
     def __init__(self, address, bridge):
         self.bridge = bridge
-        super().__init__(address, BridgeRequestHandler)
+        socketserver.TCPServer.__init__(self, address, BridgeRequestHandler)
 
 
 def serve(config):
     config.validate()
-    with BridgeTCPServer((config.listen_host, config.listen_port), MaintenanceBridge(config)) as server:
+    server = BridgeTCPServer((config.listen_host, config.listen_port), MaintenanceBridge(config))
+    try:
         LOG.info(
-            "listening on %s:%d for allowed client %s; unix socket=%s",
-            config.listen_host,
-            config.listen_port,
-            config.allowed_client_ip,
-            config.unix_socket,
+            "listening on %s:%d for client %s; unix socket=%s",
+            config.listen_host, config.listen_port, config.allowed_client_ip, config.unix_socket,
         )
         server.serve_forever(poll_interval=0.5)
+    finally:
+        server.server_close()
 
 
 def main():
-    default_config = Path(__file__).with_name("servo_maintenance.ini")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(default_config), help="path to INI configuration")
+    parser.add_argument("--config", default=str(Path(__file__).with_name("servo_maintenance.ini")))
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
     try:
         serve(load_config(args.config))
     except (ValueError, OSError) as error:
@@ -348,7 +310,6 @@ def main():
         return 2
     except KeyboardInterrupt:
         LOG.info("bridge stopped")
-        return 0
     return 0
 
 

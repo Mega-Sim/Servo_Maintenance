@@ -238,25 +238,27 @@ namespace sephi
         res.result = -1;
 
         if (msg.slave_id < 0 || msg.slave_id >= static_cast<int32_t>(slaves_.size())) {
+            // No reply queue exists for an unknown slave.  AMC only sends valid axes.
             SEP_LOGE("Firmware update axis is invalid: %d\n", msg.slave_id);
             return false;
         }
+        auto& slave = slaves_[msg.slave_id];
         if (firmware_update_in_progress_) {
             SEP_LOGE("Another firmware update is already running\n");
-            slaves_[msg.slave_id].msgq->put(res);
+            slave.msgq->put(res);
             return false;
         }
 
         char real_path[PATH_MAX] = {0,};
         if (realpath(msg.firmware.path, real_path) == nullptr) {
             SEP_LOGE("Firmware file cannot be resolved: %s\n", msg.firmware.path);
-            slaves_[msg.slave_id].msgq->put(res);
+            slave.msgq->put(res);
             return false;
         }
         const char allowed_dir[] = "/home/semes/work/bin/";
         if (strncmp(real_path, allowed_dir, sizeof(allowed_dir) - 1) != 0) {
             SEP_LOGE("Firmware file is outside work/bin: %s\n", real_path);
-            slaves_[msg.slave_id].msgq->put(res);
+            slave.msgq->put(res);
             return false;
         }
         const char* filename = strrchr(real_path, '/');
@@ -264,7 +266,7 @@ namespace sephi
         const size_t filename_len = strlen(filename);
         if (filename_len < 5 || strcasecmp(filename + filename_len - 4, ".bin") != 0) {
             SEP_LOGE("Firmware file extension is invalid: %s\n", filename);
-            slaves_[msg.slave_id].msgq->put(res);
+            slave.msgq->put(res);
             return false;
         }
 
@@ -273,7 +275,7 @@ namespace sephi
         if (stat(real_path, &file_stat) != 0 || !S_ISREG(file_stat.st_mode)
             || file_stat.st_size <= 0 || static_cast<size_t>(file_stat.st_size) > max_firmware_size) {
             SEP_LOGE("Firmware file size/type is invalid: %s\n", real_path);
-            slaves_[msg.slave_id].msgq->put(res);
+            slave.msgq->put(res);
             return false;
         }
 
@@ -282,11 +284,10 @@ namespace sephi
             (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         if (!input.eof() || firmware.size() != static_cast<size_t>(file_stat.st_size)) {
             SEP_LOGE("Firmware file read failed: %s\n", real_path);
-            slaves_[msg.slave_id].msgq->put(res);
+            slave.msgq->put(res);
             return false;
         }
 
-        auto& slave = slaves_[msg.slave_id];
         const EC_T_DWORD acontis_slave_id = ecatGetSlaveId(slave.station_address);
         if (acontis_slave_id == INVALID_SLAVE_ID) {
             SEP_LOGE("Acontis slave ID lookup failed: station=%d\n", slave.station_address);

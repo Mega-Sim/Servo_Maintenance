@@ -207,205 +207,168 @@ namespace amc
                 std::istringstream iss(buf);
                 std::string cmd;
                 std::string result = "ERROR\n";
-                iss >> cmd;
+                int axis = -1;
+                iss >> cmd >> axis;
+
+                // Rest of the line after "<cmd> <axis> " is the file path.
+                std::string filename;
+                std::getline(iss, filename);
+                if (!filename.empty() && filename[0] == ' ')
+                    filename.erase(0, 1);
+
                 auto valid_axis = [this](int axis)
                 {
                     return axis >= 0 && axis < TOTAL_AXIS_NUM
                         && motors[axis] != nullptr && oht_[axis] != nullptr;
+                };
+                // SDO 0x100A:0 (manufacturer software version), printable ASCII only.
+                auto read_version = [this](int axis, std::string& version)
+                {
+                    char value[120] = {0,};
+                    int len = motors[axis]->coeSdoUpload(
+                        0x100A, 0x0, reinterpret_cast<uint8_t*>(value), sizeof(value));
+                    if (len > (int)sizeof(value))
+                        len = sizeof(value);
+                    version.clear();
+                    for (int i = 0; i < len && value[i] != '\0'; ++i) {
+                        if (value[i] >= 0x20 && value[i] <= 0x7e)
+                            version += value[i];
+                    }
+                    if (len > 0 && version.empty())
+                        version = "UNKNOWN";
+                    return len > 0;
                 };
 
                 if (cmd == "STATUS")
                 {
                     std::ostringstream out;
                     out << "AMC CONNECTED\n";
-
-                    for (int axis = 0; axis < 4; ++axis)
+                    for (int i = 0; i < 4; ++i)
                     {
-                        out << "AXIS " << axis
-                            << " SERVO=" << (motors[axis]->servo_vendor == ecvendor_rsa ? "RSA" : "OTHER")
-                            << " ECAT=" << (motors[axis]->initialized_ ? "CONNECTED" : "DISCONNECTED")
-                            << " SERVO_ON=" << (motors[axis]->isEnabled() ? 1 : 0)
+                        out << "AXIS " << i;
+                        if (!valid_axis(i)) {
+                            out << " UNAVAILABLE\n";
+                            continue;
+                        }
+                        out << " SERVO=" << (motors[i]->servo_vendor == ecvendor_rsa ? "RSA" : "OTHER")
+                            << " ECAT=" << (motors[i]->initialized_ ? "CONNECTED" : "DISCONNECTED")
+                            << " SERVO_ON=" << (motors[i]->isEnabled() ? 1 : 0)
                             << "\n";
                     }
                     result = out.str();
                 }
+                else if (!valid_axis(axis))
+                {
+                    result = "ERROR INVALID_AXIS\n";
+                }
                 else if (cmd == "ABS_RESET")
                 {
-                    int axis = -1;
-                    iss >> axis;
-                    if (!valid_axis(axis)) {
-                        result = "ERROR INVALID_AXIS\n";
-                    } else {
-                        result = oht_[axis]->AbsoluteEncoderReset()
-                               ? "OK ABS_RESET\n" : "ERROR ABS_RESET\n";
-                    }
-                }
-                else if (cmd == "PARAM_READ")
-                {
-                    int axis = -1;
-                    std::string filename;
-                    iss >> axis;
-                    std::getline(iss, filename);
-                    if (!filename.empty() && filename[0] == ' ')
-                        filename.erase(0, 1);
-
-                    if (!valid_axis(axis)) {
-                        result = "ERROR INVALID_AXIS\n";
-                    } else {
-                        FILE* fp = fopen(filename.c_str(), "r");
-                        if (!fp) {
-                            result = "ERROR PARAM_FILE\n";
-                        } else {
-                            std::ostringstream out;
-                            out << "PARAM_READ Axis=" << axis << "\n";
-
-                            char line[256];
-                            while (fgets(line, sizeof(line), fp))
-                            {
-                                char* name = strtok(line, ",");
-                                strtok(nullptr, ",");
-                                char* idx  = strtok(nullptr, ",");
-                                char* sub  = strtok(nullptr, ",");
-                                char* type = strtok(nullptr, ", ");
-
-                                if (!name || !idx || !sub || !type)
-                                    continue;
-
-                                uint16_t index = (uint16_t)strtol(idx, nullptr, 16);
-                                uint16_t subindex = strcmp(sub, "-") ? (uint16_t)atoi(sub) : 0;
-                                int len = -1;
-
-                                out << name << " [0x" << std::hex << index
-                                    << ":" << std::dec << subindex << "] = ";
-
-                                if (!strcmp(type, "USINT")) {
-                                    uint8_t v = 0;
-                                    len = motors[axis]->coeSdoUpload(index, subindex, &v, sizeof(v));
-                                    if (len > 0) out << (unsigned int)v;
-                                }
-                                else if (!strcmp(type, "SINT")) {
-                                    int8_t v = 0;
-                                    len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
-                                    if (len > 0) out << (int)v;
-                                }
-                                else if (!strcmp(type, "UINT")) {
-                                    uint16_t v = 0;
-                                    len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
-                                    if (len > 0) out << v;
-                                }
-                                else if (!strcmp(type, "INT")) {
-                                    int16_t v = 0;
-                                    len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
-                                    if (len > 0) out << v;
-                                }
-                                else if (!strcmp(type, "UDINT")) {
-                                    uint32_t v = 0;
-                                    len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
-                                    if (len > 0) out << v;
-                                }
-                                else if (!strcmp(type, "DINT")) {
-                                    int32_t v = 0;
-                                    len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
-                                    if (len > 0) out << v;
-                                }
-
-                                if (len <= 0) out << "READ_FAIL";
-                                out << "\n";
-                            }
-
-                            fclose(fp);
-                            result = out.str();
-                        }
-                    }
+                    result = oht_[axis]->AbsoluteEncoderReset()
+                           ? "OK ABS_RESET\n" : "ERROR ABS_RESET\n";
                 }
                 else if (cmd == "FW_VERSION")
                 {
-                    int axis = -1;
-                    iss >> axis;
-                    if (!valid_axis(axis)) {
-                        result = "ERROR INVALID_AXIS\n";
-                    } else {
-                        char value[120] = {0,};
-                        int value_len = motors[axis]->coeSdoUpload(
-                            0x100A, 0x0, reinterpret_cast<uint8_t*>(value), sizeof(value));
-                        if (value_len <= 0) {
-                            result = "ERROR FW_VERSION\n";
-                        } else {
-                            std::ostringstream out;
-                            out << "FW_VERSION Axis=" << axis << " ";
-                            int printable_len = value_len < (int)sizeof(value)
-                                ? value_len : (int)sizeof(value);
-                            bool emitted = false;
-                            for (int i = 0; i < printable_len && value[i] != '\0'; ++i) {
-                                unsigned char ch = static_cast<unsigned char>(value[i]);
-                                if (ch >= 0x20 && ch <= 0x7e) {
-                                    out << value[i];
-                                    emitted = true;
-                                }
-                            }
-                            if (!emitted)
-                                out << "UNKNOWN";
-                            out << "\n";
-                            result = out.str();
-                        }
-                    }
+                    std::string version;
+                    result = read_version(axis, version)
+                           ? "FW_VERSION Axis=" + std::to_string(axis) + " " + version + "\n"
+                           : "ERROR FW_VERSION\n";
                 }
                 else if (cmd == "PARAM_UPDATE")
                 {
-                    int axis = -1;
-                    std::string filename;
-                    iss >> axis;
-                    std::getline(iss, filename);
-                    if (!filename.empty() && filename[0] == ' ')
-                        filename.erase(0, 1);
-
-                    if (!valid_axis(axis)) {
-                        result = "ERROR INVALID_AXIS\n";
+                    result = oht_[axis]->UpdateServoParameter(filename.c_str())
+                           ? "OK PARAM_UPDATE\n" : "ERROR PARAM_UPDATE\n";
+                }
+                else if (cmd == "PARAM_READ")
+                {
+                    // Line format: name,<unused>,index(hex),subindex|-,type
+                    FILE* fp = fopen(filename.c_str(), "r");
+                    if (!fp) {
+                        result = "ERROR PARAM_FILE\n";
                     } else {
-                        result = oht_[axis]->UpdateServoParameter(filename.c_str())
-                               ? "OK PARAM_UPDATE\n" : "ERROR PARAM_UPDATE\n";
+                        std::ostringstream out;
+                        out << "PARAM_READ Axis=" << axis << "\n";
+
+                        char line[256];
+                        while (fgets(line, sizeof(line), fp))
+                        {
+                            char* name = strtok(line, ",");
+                            strtok(nullptr, ",");
+                            char* idx  = strtok(nullptr, ",");
+                            char* sub  = strtok(nullptr, ",");
+                            char* type = strtok(nullptr, ", \r\n");  // type may be the last column
+
+                            if (!name || !idx || !sub || !type)
+                                continue;
+
+                            uint16_t index = (uint16_t)strtol(idx, nullptr, 16);
+                            uint16_t subindex = strcmp(sub, "-") ? (uint16_t)atoi(sub) : 0;
+                            int len = -1;
+
+                            out << name << " [0x" << std::hex << index
+                                << ":" << std::dec << subindex << "] = ";
+
+                            if (!strcmp(type, "USINT")) {
+                                uint8_t v = 0;
+                                len = motors[axis]->coeSdoUpload(index, subindex, &v, sizeof(v));
+                                if (len > 0) out << (unsigned int)v;
+                            }
+                            else if (!strcmp(type, "SINT")) {
+                                int8_t v = 0;
+                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
+                                if (len > 0) out << (int)v;
+                            }
+                            else if (!strcmp(type, "UINT")) {
+                                uint16_t v = 0;
+                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
+                                if (len > 0) out << v;
+                            }
+                            else if (!strcmp(type, "INT")) {
+                                int16_t v = 0;
+                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
+                                if (len > 0) out << v;
+                            }
+                            else if (!strcmp(type, "UDINT")) {
+                                uint32_t v = 0;
+                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
+                                if (len > 0) out << v;
+                            }
+                            else if (!strcmp(type, "DINT")) {
+                                int32_t v = 0;
+                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
+                                if (len > 0) out << v;
+                            }
+
+                            if (len <= 0) out << "READ_FAIL";
+                            out << "\n";
+                        }
+
+                        fclose(fp);
+                        result = out.str();
                     }
                 }
                 else if (cmd == "FIRMWARE_UPDATE")
                 {
-                    int axis = -1;
-                    std::string filename;
-                    iss >> axis;
-                    std::getline(iss, filename);
-                    if (!filename.empty() && filename[0] == ' ')
-                        filename.erase(0, 1);
-
-                    if (!valid_axis(axis) || (axis != 0 && axis != 2 && axis != 3)) {
+                    // Driving front/rear share one dual Servo Pack, so axis 1 is not a target.
+                    if (axis == 1) {
                         result = "ERROR INVALID_FIRMWARE_TARGET\n";
                     } else if (filename.empty()) {
                         result = "ERROR FIRMWARE_FILE\n";
                     } else {
+                        // Stop motion and turn every servo off before EC-Master touches the bus.
                         bool prepared = true;
                         for (int i = 0; i < TOTAL_AXIS_NUM; ++i) {
                             if (!valid_axis(i) || !oht_[i]->prepareFirmwareUpdate())
                                 prepared = false;
                         }
 
+                        std::string version;
                         if (!prepared || !oht_[axis]->updateFirmware(filename.c_str(), 900000)) {
                             result = "ERROR FIRMWARE_UPDATE\n";
                         } else {
-                            char version[120] = {0,};
-                            int version_len = motors[axis]->coeSdoUpload(
-                                0x100A, 0x0, reinterpret_cast<uint8_t*>(version), sizeof(version));
-                            std::ostringstream out;
-                            out << "OK FIRMWARE_UPDATE Axis=" << axis << " File=" << filename;
-                            if (version_len > 0) {
-                                out << " Version=";
-                                int printable_len = version_len < (int)sizeof(version)
-                                    ? version_len : (int)sizeof(version);
-                                for (int i = 0; i < printable_len && version[i] != '\0'; ++i) {
-                                    unsigned char ch = static_cast<unsigned char>(version[i]);
-                                    if (ch >= 0x20 && ch <= 0x7e)
-                                        out << version[i];
-                                }
-                            }
-                            out << "\n";
-                            result = out.str();
+                            result = "OK FIRMWARE_UPDATE Axis=" + std::to_string(axis) + " File=" + filename;
+                            if (read_version(axis, version))
+                                result += " Version=" + version;
+                            result += "\n";
                         }
                     }
                 }

@@ -4,6 +4,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
@@ -28,7 +29,7 @@ class FakeApplication:
         return {"ok": True, "message": "OK {}\n".format(command)}
 
 
-class LinuxWebUiTests(unittest.TestCase):
+class WebServerTestCase(unittest.TestCase):
     def setUp(self):
         self.application = FakeApplication()
         self.server = MaintenanceHTTPServer(("127.0.0.1", 0), self.application)
@@ -42,6 +43,8 @@ class LinuxWebUiTests(unittest.TestCase):
         self.server.server_close()
         self.worker.join(timeout=2)
 
+
+class LinuxWebUiTests(WebServerTestCase):
     def test_status_endpoint_calls_remote_application(self):
         with urlopen(self.base_url + "/api/status", timeout=2) as response:
             body = json.loads(response.read().decode("utf-8"))
@@ -117,3 +120,52 @@ class LinuxWebUiTests(unittest.TestCase):
             self.application.calls,
             [("firmware_update", -1, payload, "slide.bin", "slide", "FIRMWARE_UPDATE")],
         )
+
+
+class LinuxWebSafetyTests(WebServerTestCase):
+    def post(self, path, data, content_type, extra_headers=None):
+        headers = {"Content-Type": content_type}
+        headers.update(extra_headers or {})
+        request = Request(self.base_url + path, data=data, headers=headers, method="POST")
+        try:
+            with urlopen(request, timeout=2) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            return error.code, json.loads(error.read().decode("utf-8"))
+
+    def test_reset_from_another_site_or_plain_form_is_rejected(self):
+        body = json.dumps({"axis": 1}).encode("utf-8")
+        cross_site = self.post("/api/absolute-reset", body, "application/json", {"Origin": "http://evil.example"})
+        plain_form = self.post("/api/absolute-reset", body, "text/plain")
+        self.assertEqual(cross_site[0], 403)
+        self.assertEqual(plain_form[0], 400)
+        self.assertEqual(self.application.calls, [])
+
+    def test_firmware_binary_bytes_survive_multipart_parsing(self):
+        boundary = "----boundary"
+        payload = bytes(range(256)) * 4 + b"\r\n--\r\n\n\r"
+        body = (
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="target"\r\n\r\nhoist\r\n'
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="confirmation"\r\n\r\nFIRMWARE_UPDATE\r\n'
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="C:\\fw\\hoist.bin"\r\n'
+            b"Content-Type: application/octet-stream\r\n\r\n" + payload + b"\r\n"
+            b"--" + boundary.encode() + b"--\r\n"
+        )
+        status, reply = self.post("/api/firmware-update", body, "multipart/form-data; boundary=" + boundary)
+        self.assertEqual(status, 200)
+        self.assertTrue(reply["ok"])
+        self.assertEqual(
+            self.application.calls,
+            [("firmware_update", -1, payload, "C:\\fw\\hoist.bin", "hoist", "FIRMWARE_UPDATE")],
+        )
+
+    def test_invalid_firmware_version_axis_returns_400(self):
+        try:
+            urlopen(self.base_url + "/api/fw-version?axis=9", timeout=2)
+            self.fail("expected HTTP 400")
+        except HTTPError as error:
+            self.assertEqual(error.code, 400)
+        self.assertEqual(self.application.calls, [])

@@ -1,8 +1,10 @@
-"""Length-framed TCP protocol used by the servo-maintenance tool.
+"""Length-framed TCP protocol between the Linux web UI and the local bridge.
 
-The transport is intentionally small and dependency-free.  A request consists
-of one JSON header frame followed by an optional raw file payload.  A response
-is one JSON frame.  This avoids treating a Windows file path as a Linux path.
+Request : [4-byte big-endian length][JSON header][optional raw file bytes]
+Response: [4-byte big-endian length][JSON body]
+
+Only the file name and bytes travel over the wire, so a Windows path is never
+used as a Linux path.  Works on Python 3.5 and newer.
 """
 
 import json
@@ -15,61 +17,45 @@ HEADER_MAX_BYTES = 64 * 1024
 RESPONSE_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_FILE_BYTES = 1024 * 1024
 DEFAULT_MAX_FIRMWARE_BYTES = 8 * 1024 * 1024
-FIRMWARE_TARGETS = {"driving", "hoist", "slide"}
+FIRMWARE_TARGETS = ("driving", "hoist", "slide")
 FIRMWARE_CONFIRMATION = "FIRMWARE_UPDATE"
-VALID_COMMANDS = {
-    "status",
-    "firmware_version",
-    "absolute_reset",
-    "parameter_read",
-    "parameter_update",
-    "firmware_update",
-}
-AXIS_COMMANDS = {
-    "firmware_version",
-    "absolute_reset",
-    "parameter_read",
-    "parameter_update",
-}
-FILE_COMMANDS = {"parameter_read", "parameter_update", "firmware_update"}
+AXIS_COMMANDS = ("firmware_version", "absolute_reset", "parameter_read", "parameter_update")
+PARAMETER_COMMANDS = ("parameter_read", "parameter_update")
+FILE_COMMANDS = PARAMETER_COMMANDS + ("firmware_update",)
+VALID_COMMANDS = ("status",) + AXIS_COMMANDS + ("firmware_update",)
 
 
 class ProtocolError(Exception):
-    """Raised when a peer sends an invalid framed protocol message."""
+    """The peer sent a broken frame."""
 
 
 class TransportError(Exception):
-    """Raised when TCP communication fails before a usable response arrives."""
+    """TCP communication failed before a usable response arrived."""
+
+
+def is_axis(value):
+    """True for 0..3.  bool is a subclass of int, so the exact type is checked."""
+    return type(value) is int and 0 <= value <= 3
 
 
 def recv_exact(sock, size):
-    """Read exactly *size* bytes or raise ProtocolError on early disconnect."""
+    """Read exactly *size* bytes."""
     if size < 0:
         raise ProtocolError("negative read size")
-    chunks = []
-    remaining = size
-    while remaining:
-        chunk = sock.recv(remaining)
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
         if not chunk:
             raise ProtocolError("connection closed before expected bytes arrived")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+        data += chunk
+    return bytes(data)
 
 
 def send_frame(sock, payload):
-    """Send one unsigned-32-bit-length-prefixed byte frame."""
-    if not isinstance(payload, bytes):
-        raise TypeError("frame payload must be bytes")
-    if len(payload) > 0xFFFFFFFF:
-        raise ProtocolError("frame too large")
     sock.sendall(struct.pack("!I", len(payload)) + payload)
 
 
 def recv_frame(sock, max_size):
-    """Receive one framed byte payload, enforcing the supplied size limit."""
-    if max_size < 0:
-        raise ValueError("max_size must be non-negative")
     size = struct.unpack("!I", recv_exact(sock, 4))[0]
     if size > max_size:
         raise ProtocolError("frame too large: {} bytes (limit {})".format(size, max_size))
@@ -77,16 +63,16 @@ def recv_frame(sock, max_size):
 
 
 def encode_json(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return json.dumps(value, ensure_ascii=False).encode("utf-8")
 
 
-def decode_json(payload, message_name):
+def decode_json(payload, name):
     try:
         result = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as error:
-        raise ProtocolError("invalid {} JSON: {}".format(message_name, error))
+    except ValueError as error:  # UnicodeDecodeError and JSONDecodeError are ValueErrors.
+        raise ProtocolError("invalid {} JSON: {}".format(name, error))
     if not isinstance(result, dict):
-        raise ProtocolError("{} JSON must be an object".format(message_name))
+        raise ProtocolError("{} JSON must be an object".format(name))
     return result
 
 
@@ -100,43 +86,43 @@ def validate_client_request(
     confirmation="",
     max_firmware_bytes=DEFAULT_MAX_FIRMWARE_BYTES,
 ):
-    """Validate the local client request before opening a TCP connection."""
+    """Raise ValueError when a request is not allowed.  Used by the web UI and the bridge."""
     if command not in VALID_COMMANDS:
         raise ValueError("unsupported command: {}".format(command))
-    if command == "status":
-        if axis != -1:
-            raise ValueError("status axis must be -1")
-    elif command in AXIS_COMMANDS:
-        if not isinstance(axis, int) or axis < 0 or axis > 3:
-            raise ValueError("axis must be an integer from 0 to 3")
-    elif command == "firmware_update" and axis != -1:
-        raise ValueError("firmware_update axis must be -1")
     if not isinstance(payload, bytes):
-        raise TypeError("payload must be bytes")
+        raise ValueError("payload must be bytes")
+
+    if command in AXIS_COMMANDS:
+        if not is_axis(axis):
+            raise ValueError("axis must be an integer from 0 to 3")
+    elif axis != -1:
+        raise ValueError("{} axis must be -1".format(command))
+
     if command == "firmware_update":
         if target not in FIRMWARE_TARGETS:
             raise ValueError("firmware target must be driving, hoist, or slide")
         if confirmation != FIRMWARE_CONFIRMATION:
             raise ValueError("firmware confirmation must be FIRMWARE_UPDATE")
-        if not filename or not filename.lower().endswith(".bin"):
+        if not isinstance(filename, str) or not filename.lower().endswith(".bin"):
             raise ValueError("firmware filename must end with .bin")
-        if len(payload) == 0:
-            raise ValueError("firmware file payload is empty")
-        if len(payload) > max_firmware_bytes:
-            raise ValueError("firmware file exceeds {} bytes".format(max_firmware_bytes))
-    elif command in FILE_COMMANDS:
-        if not filename:
+        limit = max_firmware_bytes
+    elif command in PARAMETER_COMMANDS:
+        if not isinstance(filename, str) or not filename:
             raise ValueError("filename is required for parameter commands")
-        if len(payload) == 0:
-            raise ValueError("parameter file payload is empty")
-        if len(payload) > max_file_bytes:
-            raise ValueError("parameter file exceeds {} bytes".format(max_file_bytes))
-    elif payload:
-        raise ValueError("payload is only valid for parameter commands")
+        limit = max_file_bytes
+    else:
+        if payload:
+            raise ValueError("payload is only valid for file commands")
+        return
+
+    if not payload:
+        raise ValueError("uploaded file is empty")
+    if len(payload) > limit:
+        raise ValueError("uploaded file exceeds {} bytes".format(limit))
 
 
 class RemoteMaintenanceClient:
-    """Synchronous client used by the Windows-local web UI."""
+    """Synchronous client used by the Linux web UI to call the local bridge."""
 
     def __init__(
         self,
@@ -156,14 +142,8 @@ class RemoteMaintenanceClient:
 
     def request(self, command, axis=-1, payload=b"", filename="", target="", confirmation=""):
         validate_client_request(
-            command,
-            axis,
-            payload,
-            filename,
-            self.max_file_bytes,
-            target,
-            confirmation,
-            self.max_firmware_bytes,
+            command, axis, payload, filename,
+            self.max_file_bytes, target, confirmation, self.max_firmware_bytes,
         )
         header = {
             "protocol": PROTOCOL_NAME,
@@ -179,8 +159,7 @@ class RemoteMaintenanceClient:
             with socket.create_connection((self.host, self.port), self.timeout) as sock:
                 sock.settimeout(self.timeout)
                 send_frame(sock, encode_json(header))
-                if payload:
-                    sock.sendall(payload)
+                sock.sendall(payload)
                 response = decode_json(recv_frame(sock, RESPONSE_MAX_BYTES), "response")
         except (OSError, ProtocolError) as error:
             raise TransportError(str(error))

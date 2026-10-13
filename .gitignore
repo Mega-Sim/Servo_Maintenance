@@ -1,0 +1,6 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Firmware and uploaded files are kept on the controller, not in Git.
+*.bin

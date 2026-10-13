@@ -4,6 +4,7 @@
 import argparse
 import configparser
 import hmac
+import itertools
 import logging
 import os
 import re
@@ -12,6 +13,8 @@ import socketserver
 import sys
 import tempfile
 import threading
+import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
@@ -26,6 +29,7 @@ from common.maintenance_protocol import (  # noqa: E402
     FIRMWARE_TARGETS,
     HEADER_MAX_BYTES,
     PROTOCOL_NAME,
+    RESPONSE_MAX_BYTES,
     ProtocolError,
     decode_json,
     encode_json,
@@ -142,26 +146,47 @@ class MaintenanceBridge:
         self.config = config
         self._operation_lock = threading.Lock()
         self._command_sender = command_sender or self._send_unix_command
+        self._operation_ids = itertools.count(1)
 
     def handle_request(self, header, payload, peer_ip):
+        request_id = next(self._operation_ids)
+        # Log only validated operation metadata, not tokens, confirmation, file content.
+        operation = header.get("command") if header.get("command") in AMC_COMMANDS else "unknown"
+        started = time.monotonic()
         try:
             self._validate(header, payload, peer_ip)
         except (RequestRejected, ValueError) as error:
+            LOG.warning("BRIDGE_REJECT id=%d cmd=%s peer=%s reason=%s",
+                        request_id, operation, peer_ip, error)
             return {"ok": False, "message": "ERROR: {}".format(error)}
 
-        # A firmware update can take minutes.  Answer other requests at once instead of
-        # letting them wait in the queue until the web UI times out.
+        # Reject concurrency immediately instead of letting maintenance block the UI.
         if not self._operation_lock.acquire(False):
+            LOG.warning("BRIDGE_BUSY id=%d cmd=%s axis=%s peer=%s",
+                        request_id, operation, header["axis"], peer_ip)
             return {"ok": False, "message": "ERROR: another maintenance operation is running"}
+        LOG.info("BRIDGE_START id=%d cmd=%s axis=%s target=%s bytes=%d peer=%s",
+                 request_id, operation, header["axis"], header.get("target") or "-",
+                 len(payload), peer_ip)
         try:
-            return self._execute(header, payload)
+            response = self._execute(header, payload, request_id)
+            LOG.log(logging.INFO if response["ok"] else logging.WARNING,
+                    "BRIDGE_END id=%d cmd=%s axis=%s ok=%s elapsed_ms=%.1f response_bytes=%d",
+                    request_id, operation, header["axis"], response["ok"],
+                    (time.monotonic() - started) * 1000,
+                    len(response["message"].encode("utf-8", "replace")))
+            return response
         except RequestRejected as error:
+            LOG.warning("BRIDGE_EXEC_REJECT id=%d cmd=%s stage=execute reason=%s",
+                        request_id, operation, error)
             return {"ok": False, "message": "ERROR: {}".format(error)}
         except OSError as error:
-            LOG.exception("controller socket failure")
+            LOG.exception("BRIDGE_SOCKET_FAIL id=%d cmd=%s axis=%s error_type=%s",
+                          request_id, operation, header["axis"], type(error).__name__)
             return {"ok": False, "message": "ERROR: controller socket failure: {}".format(error)}
         except Exception as error:  # Keep the TCP worker alive and report the failure.
-            LOG.exception("unexpected maintenance bridge failure")
+            LOG.exception("BRIDGE_UNEXPECTED id=%d cmd=%s axis=%s",
+                          request_id, operation, header["axis"])
             return {"ok": False, "message": "ERROR: bridge failure: {}".format(error)}
         finally:
             self._operation_lock.release()
@@ -195,18 +220,26 @@ class MaintenanceBridge:
         if command in FILE_COMMANDS:
             safe_filename(header["filename"])
 
-    def _execute(self, header, payload):
+    def _execute(self, header, payload, request_id=None):
         command = header["command"]
         axis = header["axis"]
         path = ""
         if command in FILE_COMMANDS:
             path = self._save_uploaded_file(header["filename"], payload)
+            LOG.info("BRIDGE_FILE_READY id=%s cmd=%s axis=%s bytes=%d",
+                     request_id, command, axis, len(payload))
         if command == "firmware_update":
             axis = self.config.firmware_targets[header["target"]]
 
         amc_command, success_prefix = AMC_COMMANDS[command]
+        LOG.info("BRIDGE_AMC_CALL id=%s cmd=%s axis=%s", request_id, command, axis)
         result = self._command_sender(amc_command.format(axis=axis, path=path))
-        return {"ok": result.startswith(success_prefix), "message": result}
+        # A successful heading is not enough when a parameter row failed.
+        ok = result.startswith(success_prefix)
+        if command == "parameter_read" and ("READ_FAIL" in result or "TYPE_MISMATCH" in result):
+            ok = False
+            LOG.warning("BRIDGE_PARAM_PARTIAL_FAILURE id=%s axis=%s", request_id, axis)
+        return {"ok": ok, "message": result}
 
     def _save_uploaded_file(self, filename, payload):
         """Store under spool_dir with the original name.  Never overwrite different content."""
@@ -237,6 +270,7 @@ class MaintenanceBridge:
         data = command.encode("utf-8")
         if len(data) >= 1024:  # AMC reads one 1024-byte buffer.
             raise RequestRejected("controller command is too long")
+        LOG.info("BRIDGE_UNIX_CONNECT socket=%s", self.config.unix_socket)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unix_sock:
             unix_sock.settimeout(self.config.unix_timeout_seconds)
             unix_sock.connect(self.config.unix_socket)
@@ -248,8 +282,12 @@ class MaintenanceBridge:
                 if not chunk:
                     break
                 reply += chunk
+                if len(reply) > RESPONSE_MAX_BYTES - 1024:
+                    # JSON envelope adds overhead; never collect unbounded AMC output.
+                    raise RequestRejected("controller response exceeds safe size limit")
         if not reply:
             raise RequestRejected("controller returned no response")
+        LOG.info("BRIDGE_UNIX_REPLY bytes=%d", len(reply))
         return reply.decode("utf-8", errors="replace")
 
 
@@ -264,8 +302,12 @@ class BridgeRequestHandler(socketserver.BaseRequestHandler):
             payload = recv_exact(self.request, length)
             response = self.server.bridge.handle_request(header, payload, self.client_address[0])
         except ProtocolError as error:
+            LOG.warning("BRIDGE_PROTOCOL_REJECT peer=%s error_type=%s",
+                        self.client_address[0], type(error).__name__)
             response = {"ok": False, "message": "ERROR: invalid request: {}".format(error)}
         except OSError as error:
+            LOG.warning("BRIDGE_NETWORK_FAIL peer=%s error_type=%s",
+                        self.client_address[0], type(error).__name__)
             response = {"ok": False, "message": "ERROR: network failure: {}".format(error)}
         try:
             send_frame(self.request, encode_json(response))
@@ -287,12 +329,28 @@ def serve(config):
     server = BridgeTCPServer((config.listen_host, config.listen_port), MaintenanceBridge(config))
     try:
         LOG.info(
-            "listening on %s:%d for client %s; unix socket=%s",
+            "BRIDGE_LISTEN host=%s port=%d allowed_ip=%s unix_socket=%s",
             config.listen_host, config.listen_port, config.allowed_client_ip, config.unix_socket,
         )
+        if not config.shared_token or config.allowed_client_ip in ("", "*"):
+            LOG.warning("BRIDGE_ACCESS_UNRESTRICTED: verify token and IP restrictions before deployment")
         server.serve_forever(poll_interval=0.5)
     finally:
         server.server_close()
+
+
+def setup_file_logging():
+    """Keep diagnostic logs across restarts, with bounded disk use."""
+    try:
+        logs = PACKAGE_ROOT / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            str(logs / "servo_maintenance_bridge.log"), maxBytes=2 * 1024 * 1024,
+            backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        LOG.addHandler(handler)
+    except OSError as error:
+        LOG.warning("BRIDGE_LOG_FILE_UNAVAILABLE error_type=%s", type(error).__name__)
 
 
 def main():
@@ -301,6 +359,7 @@ def main():
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
+    setup_file_logging()
     try:
         serve(load_config(args.config))
     except (ValueError, OSError) as error:

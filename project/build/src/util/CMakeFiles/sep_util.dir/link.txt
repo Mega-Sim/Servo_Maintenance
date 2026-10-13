@@ -1,0 +1,2 @@
+/usr/bin/ar qc ../../../lib/libsep_util.a  CMakeFiles/sep_util.dir/logger.cpp.o CMakeFiles/sep_util.dir/sephi_ipc.cpp.o CMakeFiles/sep_util.dir/equation_solver.cpp.o
+/usr/bin/ranlib ../../../lib/libsep_util.a

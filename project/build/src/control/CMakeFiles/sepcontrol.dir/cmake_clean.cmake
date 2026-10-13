@@ -1,0 +1,26 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/sepcontrol.dir/servo_motor.cpp.o"
+  "CMakeFiles/sepcontrol.dir/ec_servo_motor.cpp.o"
+  "CMakeFiles/sepcontrol.dir/ec_servo_emulator.cpp.o"
+  "CMakeFiles/sepcontrol.dir/servo_motion.cpp.o"
+  "CMakeFiles/sepcontrol.dir/robot_motion.cpp.o"
+  "CMakeFiles/sepcontrol.dir/velocity_profile.cpp.o"
+  "CMakeFiles/sepcontrol.dir/robotic_module.cpp.o"
+  "CMakeFiles/sepcontrol.dir/axes_module.cpp.o"
+  "CMakeFiles/sepcontrol.dir/multi_axes_module.cpp.o"
+  "CMakeFiles/sepcontrol.dir/__/ecmaster/rpc/ecmaster.grpc.pb.cc.o"
+  "CMakeFiles/sepcontrol.dir/__/ecmaster/rpc/ecmaster.pb.cc.o"
+  "CMakeFiles/sepcontrol.dir/io_board.cpp.o"
+  "CMakeFiles/sepcontrol.dir/xr17v352_rt.cpp.o"
+  "CMakeFiles/sepcontrol.dir/gpio.cpp.o"
+  "CMakeFiles/sepcontrol.dir/serial_port.cpp.o"
+  "CMakeFiles/sepcontrol.dir/__/app/oht/oht_onboard_io.cpp.o"
+  "CMakeFiles/sepcontrol.dir/__/app/oht/oht_io_port_map.cpp.o"
+  "../../../lib/libsepcontrol.pdb"
+  "../../../lib/libsepcontrol.a"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang CXX)
+  include(CMakeFiles/sepcontrol.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()

@@ -1,0 +1,2 @@
+/usr/bin/ar qc ../../../../lib/liboht_control.a  CMakeFiles/oht_control.dir/oht_behaviors.cpp.o CMakeFiles/oht_control.dir/oht_controller.cpp.o CMakeFiles/oht_control.dir/oht_localization.cpp.o CMakeFiles/oht_control.dir/oht_io_port_map.cpp.o CMakeFiles/oht_control.dir/__/__/ecmaster/emul/oht/oht_map.cpp.o CMakeFiles/oht_control.dir/__/__/control/oht_hoist_unit_conversion.cpp.o CMakeFiles/oht_control.dir/oht_serial_devices.cpp.o CMakeFiles/oht_control.dir/oht_amc_axis.cpp.o CMakeFiles/oht_control.dir/oht_mark_detector.cpp.o
+/usr/bin/ranlib ../../../../lib/liboht_control.a

@@ -184,6 +184,7 @@ namespace sephi {
             uint16_t subindex;  // coe subindex
             uint16_t length;    // payload length
             uint8_t data[EM_MSG_Q_DATA_SIZE]; // payload
+            uint16_t absolute_index; // 1: maintenance caller supplied an absolute CoE index
         };
         struct RscRequestMsg {
             pid_t pid;
@@ -196,6 +197,7 @@ namespace sephi {
             uint32_t servo_module_num;
             uint32_t servo_vendor;
             uint32_t slave_type;
+            uint32_t product_code;
             
         };
         struct FirmwareMsg {
@@ -237,9 +239,9 @@ namespace sephi {
         };
 
     public:
-        ECatSdoMsg(){sdo.timeout = COE_SDO_TIMEOUT_MS;}
-        ECatSdoMsg(Command _command): command(_command){sdo.timeout = COE_SDO_TIMEOUT_MS;}
-        ECatSdoMsg(Command _command, uint32_t _slave_id): command(_command), slave_id(_slave_id){sdo.timeout = COE_SDO_TIMEOUT_MS;}
+        ECatSdoMsg(){sdo.timeout = COE_SDO_TIMEOUT_MS; sdo.absolute_index = 0;}
+        ECatSdoMsg(Command _command): command(_command){sdo.timeout = COE_SDO_TIMEOUT_MS; sdo.absolute_index = 0;}
+        ECatSdoMsg(Command _command, uint32_t _slave_id): command(_command), slave_id(_slave_id){sdo.timeout = COE_SDO_TIMEOUT_MS; sdo.absolute_index = 0;}
     };
 
     // SERVO -> ATLAS

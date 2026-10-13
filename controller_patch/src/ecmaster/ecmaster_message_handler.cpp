@@ -326,15 +326,23 @@ namespace sephi
             return false;
         }
 
+        SEP_LOGI("[SMT] FOE_START axis=%d station=%d product=0x%x bytes=%zu",
+                 msg.slave_id, slave.station_address, slave.product_code, firmware.size());
         firmware_update_in_progress_ = true;
         stopAllServo();
+        SEP_LOGI("[SMT] FOE_STAGE stage=stop_all_servo axis=%d", msg.slave_id);
         EC_T_DWORD error = emSetSlaveState(
             INSTANCE_MASTER_DEFAULT, acontis_slave_id, DEVICE_STATE_INIT, 30000);
+        SEP_LOGI("[SMT] FOE_STAGE stage=init axis=%d code=0x%08lx",
+                 msg.slave_id, static_cast<unsigned long>(error));
         if (error == EC_E_NOERROR) {
             error = emSetSlaveState(
                 INSTANCE_MASTER_DEFAULT, acontis_slave_id, DEVICE_STATE_BOOTSTRAP, 30000);
+            SEP_LOGI("[SMT] FOE_STAGE stage=bootstrap axis=%d code=0x%08lx",
+                     msg.slave_id, static_cast<unsigned long>(error));
         }
         if (error == EC_E_NOERROR) {
+            SEP_LOGI("[SMT] FOE_STAGE stage=download_begin axis=%d", msg.slave_id);
             const EC_T_DWORD timeout = msg.firmware.timeout_ms == 0 ? 900000 : msg.firmware.timeout_ms;
             error = emFoeFileDownload(
                 INSTANCE_MASTER_DEFAULT,
@@ -345,13 +353,20 @@ namespace sephi
                 static_cast<EC_T_DWORD>(firmware.size()),
                 0x01020304,
                 timeout);
+            SEP_LOGI("[SMT] FOE_STAGE stage=download_end axis=%d code=0x%08lx",
+                     msg.slave_id, static_cast<unsigned long>(error));
         }
 
+        SEP_LOGI("[SMT] FOE_STAGE stage=restore_init axis=%d", msg.slave_id);
         EC_T_DWORD restore_error = emSetSlaveState(
             INSTANCE_MASTER_DEFAULT, acontis_slave_id, DEVICE_STATE_INIT, 30000);
+        SEP_LOGI("[SMT] FOE_STAGE stage=restore_init_done axis=%d code=0x%08lx",
+                 msg.slave_id, static_cast<unsigned long>(restore_error));
         if (error == EC_E_NOERROR && restore_error == EC_E_NOERROR) {
             restore_error = emSetSlaveState(
                 INSTANCE_MASTER_DEFAULT, acontis_slave_id, DEVICE_STATE_PREOP, 30000);
+            SEP_LOGI("[SMT] FOE_STAGE stage=preop axis=%d code=0x%08lx",
+                     msg.slave_id, static_cast<unsigned long>(restore_error));
         }
         if (error == EC_E_NOERROR && restore_error == EC_E_NOERROR) {
             uint8_t reset_value = 1;
@@ -360,13 +375,19 @@ namespace sephi
                 ? 0x2c10 : 0x3010;
             restore_error = ecatCoeSdoDownloadEx(
                 slave.bus_index, reset_index, 0, &reset_value, sizeof(reset_value), 30000, 0);
+            SEP_LOGI("[SMT] FOE_STAGE stage=reset_sdo axis=%d index=0x%04x code=0x%08lx",
+                     msg.slave_id, reset_index, static_cast<unsigned long>(restore_error));
             usleep(6000000);
         }
 
+        SEP_LOGI("[SMT] FOE_STAGE stage=restore_op axis=%d", msg.slave_id);
         const bool op_restored = changeECatState(eEcatState_OP);
         firmware_update_in_progress_ = false;
         recover_in_process_ = false;
 
+        SEP_LOGI("[SMT] FOE_RESTORE_STATUS axis=%d foe_code=0x%08lx restore_code=0x%08lx op=%d",
+                 msg.slave_id, static_cast<unsigned long>(error),
+                 static_cast<unsigned long>(restore_error), op_restored ? 1 : 0);
         if (error == EC_E_NOERROR && restore_error == EC_E_NOERROR && op_restored) {
             res.result = 0;
             SEP_LOGI("Firmware update completed: axis=%d station=%d file=%s\n",

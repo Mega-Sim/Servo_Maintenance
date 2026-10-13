@@ -82,10 +82,6 @@ class BridgeConfig:
         self.firmware_targets = firmware_targets or {"driving": 0, "hoist": 2, "slide": 3}
 
     def validate(self):
-        if self.shared_token in PLACEHOLDER_TOKENS or len(self.shared_token) < 16:
-            raise ValueError("shared_token must be a non-placeholder value of at least 16 characters")
-        if not self.allowed_client_ip:
-            raise ValueError("allowed_client_ip must be configured")
         if not self.unix_socket.startswith("/"):
             raise ValueError("unix_socket must be an absolute path")
         if not 1 <= self.max_file_bytes <= 16 * 1024 * 1024:
@@ -173,12 +169,14 @@ class MaintenanceBridge:
     def _validate(self, header, payload, peer_ip):
         if header.get("protocol") != PROTOCOL_NAME:
             raise RequestRejected("unsupported protocol")
-        token = header.get("token")
-        # Compare bytes: compare_digest raises TypeError for non-ASCII str.
-        expected = self.config.shared_token.encode("utf-8")
-        if not isinstance(token, str) or not hmac.compare_digest(token.encode("utf-8"), expected):
-            raise RequestRejected("authentication failed")
-        if self.config.allowed_client_ip not in ("*", peer_ip):
+        # Empty shared_token / allowed_client_ip / "*" disable the corresponding check.
+        if self.config.shared_token:
+            token = header.get("token")
+            # Compare bytes: compare_digest raises TypeError for non-ASCII str.
+            expected = self.config.shared_token.encode("utf-8")
+            if not isinstance(token, str) or not hmac.compare_digest(token.encode("utf-8"), expected):
+                raise RequestRejected("authentication failed")
+        if self.config.allowed_client_ip not in ("", "*", peer_ip):
             raise RequestRejected("client IP is not allowed")
         if header.get("payload_length") != len(payload):
             raise RequestRejected("payload length does not match header")

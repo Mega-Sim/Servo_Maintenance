@@ -61,14 +61,10 @@ class WebConfig:
             raise ValueError("motion_ip must use the local Linux bridge")
         if not 1 <= self.tcp_port <= 65535:
             raise ValueError("tcp_port must be between 1 and 65535")
-        if self.shared_token in PLACEHOLDER_TOKENS or len(self.shared_token) < 16:
-            raise ValueError("shared_token must match the Linux setting and be at least 16 characters")
         if not self.web_host:
             raise ValueError("web host must be configured")
         if not 1 <= self.web_port <= 65535:
             raise ValueError("web UI port must be between 1 and 65535")
-        if not self.allowed_browser_ip:
-            raise ValueError("allowed_browser_ip must be configured")
         if not 1 <= self.max_file_bytes <= 16 * 1024 * 1024:
             raise ValueError("max_file_bytes must be between 1 and 16777216")
         if not 1 <= self.max_firmware_bytes <= DEFAULT_MAX_FIRMWARE_BYTES:
@@ -260,7 +256,7 @@ class MaintenanceRequestHandler(BaseHTTPRequestHandler):
 
     def _browser_allowed(self):
         allowed = self.server.application.config.allowed_browser_ip
-        if allowed in ("*", self.client_address[0]):
+        if allowed in ("", "*", self.client_address[0]):
             return True
         self._send_json(403, {"ok": False, "message": "browser IP is not allowed"})
         return False

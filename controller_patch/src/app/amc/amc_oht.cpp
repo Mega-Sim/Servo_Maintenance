@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <sstream>
+#include <set>
 #include <thread>
 #include <cstdio>
 #include <cstdlib>
@@ -221,12 +222,62 @@ namespace amc
                     return axis >= 0 && axis < TOTAL_AXIS_NUM
                         && motors[axis] != nullptr && oht_[axis] != nullptr;
                 };
-                // SDO 0x100A:0 (manufacturer software version), printable ASCII only.
-                auto read_version = [this](int axis, std::string& version)
+                // Legacy RSA 2+1+1 is the default and is never re-addressed.
+                // Confirm the 4-axis profile with *both* EEPROM Product Code
+                // and four logical channels sharing the same physical bus index.
+                auto rsa_four_axis = [this, &valid_axis]() -> bool
+                {
+                    if (!valid_axis(0) || motors[0]->servo_vendor != ecvendor_rsa ||
+                        motors[0]->product_code != 0x02020033)
+                        return false;
+                    const int bus = motors[0]->bus_index;
+                    for (int i = 0; i < 4; ++i) {
+                        if (!valid_axis(i) || motors[i]->servo_vendor != ecvendor_rsa ||
+                            motors[i]->product_code != 0x02020033 ||
+                            motors[i]->bus_index != bus || motors[i]->module_num != i)
+                            return false;
+                    }
+                    return true;
+                };
+                const bool quad = rsa_four_axis();
+                // The LS iX7MA4444B Product Code is NOT present in the
+                // available controller sources/ESI; deliberately reject until
+                // the true EEPROM code is verified (do not invent one).
+#ifndef LS_IX7MA4444B_PRODUCT_CODE
+#define LS_IX7MA4444B_PRODUCT_CODE 0x00000000
+#endif
+                auto maintenance_model = [this, quad](int axis) -> const char*
+                {
+                    const auto* m = motors[axis];
+                    if (m->servo_vendor == ecvendor_rsa) {
+                        if (m->product_code == 0x02020033 && quad) return "RSA_4AXIS";
+                        if (m->product_code == 0x02020012 || m->product_code == 0x02020013)
+                            return "RSA_DUAL";
+                        if (m->product_code == 0x02010013) return "RSA_SINGLE";
+                        if (m->product_code == 0x02020002) return "RSA_TRIPLE";
+                        return "RSA_UNKNOWN_PRODUCT";
+                    }
+                    if (m->servo_vendor == ecvendor_yaskawa) {
+                        if (m->product_code == 0x02200901) return "YASKAWA_SIGMA7";
+                        if (m->product_code == 0x02200902) return "YASKAWA_DUAL";
+                        return "YASKAWA_UNKNOWN_PRODUCT";
+                    }
+                    if (m->servo_vendor == ecvendor_mecapion) {
+                        if (LS_IX7MA4444B_PRODUCT_CODE != 0 &&
+                            m->product_code == LS_IX7MA4444B_PRODUCT_CODE)
+                            return "LS_IX7MA4444B";
+                        return "LS_UNKNOWN_PRODUCT";
+                    }
+                    return "UNKNOWN_VENDOR";
+                };
+                // SDO 0x100A:0 is pack-level software version on the
+                // integrated RSA pack; use an absolute index to avoid 0x800
+                // legacy module translation. This does not claim a per-axis FW.
+                auto read_version = [this, quad](int axis, std::string& version)
                 {
                     char value[120] = {0,};
                     int len = motors[axis]->coeSdoUpload(
-                        0x100A, 0x0, reinterpret_cast<uint8_t*>(value), sizeof(value));
+                        0x100A, 0x0, reinterpret_cast<uint8_t*>(value), sizeof(value), quad);
                     if (len > (int)sizeof(value))
                         len = sizeof(value);
                     version.clear();
@@ -250,7 +301,11 @@ namespace amc
                             out << " UNAVAILABLE\n";
                             continue;
                         }
-                        out << " SERVO=" << (motors[i]->servo_vendor == ecvendor_rsa ? "RSA" : "OTHER")
+                        out << " SERVO=" << (motors[i]->servo_vendor == ecvendor_rsa ? "RSA" :
+                                                 motors[i]->servo_vendor == ecvendor_mecapion ? "LS_MECAPION" :
+                                                 motors[i]->servo_vendor == ecvendor_yaskawa ? "YASKAWA" : "OTHER")
+                            << " PROFILE=" << maintenance_model(i)
+                            << " PRODUCT=0x" << std::hex << motors[i]->product_code << std::dec
                             << " ECAT=" << (motors[i]->initialized_ ? "CONNECTED" : "DISCONNECTED")
                             << " SERVO_ON=" << (motors[i]->isEnabled() ? 1 : 0)
                             << "\n";
@@ -260,6 +315,21 @@ namespace amc
                 else if (!valid_axis(axis))
                 {
                     result = "ERROR INVALID_AXIS\n";
+                }
+                else if (motors[axis]->servo_vendor == ecvendor_mecapion ||
+                         motors[axis]->servo_vendor == ecvendor_yaskawa)
+                {
+                    // Vendor-specific maintenance commands will be implemented later.
+                    result = std::string("ERROR NOT_IMPLEMENTED ") + maintenance_model(axis) + "\n";
+                }
+                else if (motors[axis]->servo_vendor == ecvendor_rsa &&
+                         !strcmp(maintenance_model(axis), "RSA_UNKNOWN_PRODUCT"))
+                {
+                    result = "ERROR UNSUPPORTED_RSA_PRODUCT\n";
+                }
+                else if (motors[axis]->servo_vendor != ecvendor_rsa)
+                {
+                    result = "ERROR UNSUPPORTED_SERVO\n";
                 }
                 else if (cmd == "ABS_RESET")
                 {
@@ -275,81 +345,109 @@ namespace amc
                 }
                 else if (cmd == "PARAM_UPDATE")
                 {
-                    result = oht_[axis]->UpdateServoParameter(filename.c_str())
+                    result = oht_[axis]->UpdateServoParameter(filename.c_str(), quad)
                            ? "OK PARAM_UPDATE\n" : "ERROR PARAM_UPDATE\n";
                 }
                 else if (cmd == "PARAM_READ")
                 {
-                    // Line format: name,<unused>,index(hex),subindex|-,type
                     FILE* fp = fopen(filename.c_str(), "r");
                     if (!fp) {
                         result = "ERROR PARAM_FILE\n";
                     } else {
                         std::ostringstream out;
-                        out << "PARAM_READ Axis=" << axis << "\n";
-
-                        char line[256];
-                        while (fgets(line, sizeof(line), fp))
-                        {
+                        int total = 0, skipped = 0, succeeded = 0, failed = 0;
+                        std::set<uint32_t> seen;
+                        char line[512];
+                        const unsigned int wanted_group = static_cast<unsigned int>(2 + axis);
+                        while (fgets(line, sizeof(line), fp)) {
                             char* name = strtok(line, ",");
                             strtok(nullptr, ",");
-                            char* idx  = strtok(nullptr, ",");
-                            char* sub  = strtok(nullptr, ",");
-                            char* type = strtok(nullptr, ", \r\n");  // type may be the last column
-
-                            if (!name || !idx || !sub || !type)
+                            char* idx = strtok(nullptr, ",");
+                            char* sub = strtok(nullptr, ",");
+                            char* type = strtok(nullptr, ", \r\n");
+                            if (!name || !idx || !sub || !type) {
+                                ++failed;
                                 continue;
-
-                            uint16_t index = (uint16_t)strtol(idx, nullptr, 16);
-                            uint16_t subindex = strcmp(sub, "-") ? (uint16_t)atoi(sub) : 0;
-                            int len = -1;
-
-                            out << name << " [0x" << std::hex << index
-                                << ":" << std::dec << subindex << "] = ";
-
-                            if (!strcmp(type, "USINT")) {
-                                uint8_t v = 0;
-                                len = motors[axis]->coeSdoUpload(index, subindex, &v, sizeof(v));
-                                if (len > 0) out << (unsigned int)v;
                             }
-                            else if (!strcmp(type, "SINT")) {
-                                int8_t v = 0;
-                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
-                                if (len > 0) out << (int)v;
+                            char* end = nullptr;
+                            const unsigned long raw_index = strtoul(idx, &end, 16);
+                            if (end == idx || *end || raw_index > 0xffff) {
+                                ++failed;
+                                continue;
                             }
-                            else if (!strcmp(type, "UINT")) {
-                                uint16_t v = 0;
-                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
-                                if (len > 0) out << v;
+                            unsigned long raw_sub = 0;
+                            if (strcmp(sub, "-") != 0) {
+                                raw_sub = strtoul(sub, &end, 0);
+                                if (end == sub || *end || raw_sub > 255) {
+                                    ++failed;
+                                    continue;
+                                }
                             }
-                            else if (!strcmp(type, "INT")) {
-                                int16_t v = 0;
-                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
-                                if (len > 0) out << v;
+                            const uint16_t index = static_cast<uint16_t>(raw_index);
+                            const uint16_t subindex = static_cast<uint16_t>(raw_sub);
+                            if (quad && ((index >> 12) != wanted_group)) {
+                                ++skipped;
+                                continue;
                             }
-                            else if (!strcmp(type, "UDINT")) {
-                                uint32_t v = 0;
-                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
-                                if (len > 0) out << v;
+                            const uint32_t key = (static_cast<uint32_t>(index) << 8) | subindex;
+                            if (quad && !seen.insert(key).second) {
+                                ++skipped;
+                                continue;
                             }
-                            else if (!strcmp(type, "DINT")) {
-                                int32_t v = 0;
-                                len = motors[axis]->coeSdoUpload(index, subindex, (uint8_t*)&v, sizeof(v));
-                                if (len > 0) out << v;
+                            int expected = 0;
+                            const bool negative = !strcmp(type, "SINT") ||
+                                !strcmp(type, "INT") || !strcmp(type, "DINT");
+                            if (!strcmp(type, "USINT") || !strcmp(type, "SINT")) expected = 1;
+                            else if (!strcmp(type, "UINT") || !strcmp(type, "INT")) expected = 2;
+                            else if (!strcmp(type, "UDINT") || !strcmp(type, "DINT")) expected = 4;
+                            ++total;
+                            // Always provide a full 4-byte numeric receive buffer.
+                            // Many drives return UINT/DINT despite an outdated CSV 'Type'.
+                            uint8_t data[4] = {};
+                            const int len = expected > 0
+                                ? motors[axis]->coeSdoUpload(index, subindex, data, sizeof(data), quad)
+                                : -1;
+                            out << name << " [0x" << std::hex << index << ":" << std::dec << subindex << "] = ";
+                            if (len == expected && expected > 0) {
+                                uint32_t value = 0;
+                                memcpy(&value, data, expected);
+                                if (negative) {
+                                    if (expected == 1) out << static_cast<int>(static_cast<int8_t>(value));
+                                    else if (expected == 2) out << static_cast<int16_t>(value);
+                                    else out << static_cast<int32_t>(value);
+                                } else out << value;
+                                ++succeeded;
+                            } else if (len > 0) {
+                                // No silent truncation; preserve original type discrepancy.
+                                out << "TYPE_MISMATCH expected=" << expected << " received=" << len;
+                                ++failed;
+                            } else {
+                                out << "READ_FAIL";
+                                ++failed;
                             }
-
-                            if (len <= 0) out << "READ_FAIL";
                             out << "\n";
                         }
-
                         fclose(fp);
-                        result = out.str();
+                        if (total == 0 && failed == 0)
+                            result = "ERROR PARAM_AXIS_NO_ENTRIES\n";
+                        else {
+                            std::ostringstream heading;
+                            heading << (failed ? "ERROR PARAM_READ Axis=" : "PARAM_READ Axis=") << axis
+                                    << " PROFILE=" << (quad ? "RSA_4AXIS" : "RSA_2_1_1")
+                                    << " TOTAL=" << total << " OK=" << succeeded
+                                    << " FAIL=" << failed << " SKIP=" << skipped << "\n";
+                            result = heading.str() + out.str();
+                        }
                     }
                 }
                 else if (cmd == "FIRMWARE_UPDATE")
                 {
                     // Driving front/rear share one dual Servo Pack, so axis 1 is not a target.
-                    if (axis == 1) {
+                    if (quad) {
+                        // The whole 4-axis pack shares one physical EtherCAT slave.
+                        // FoE package/target mapping requires separate validation.
+                        result = "ERROR FOE_4AXIS_NOT_VALIDATED\n";
+                    } else if (axis == 1) {
                         result = "ERROR INVALID_FIRMWARE_TARGET\n";
                     } else if (filename.empty()) {
                         result = "ERROR FIRMWARE_FILE\n";
@@ -899,8 +997,7 @@ namespace amc
         dpram_.Cmd_Dpram().IoinValue2_1 = IO_Input[1];
         dpram_.Cmd_Dpram().IoinValue3   = IO_Input[2];
         dpram_.Cmd_Dpram().IoinValue4   = IO_Input[3];
-        dpram_.Cmd_Dpram().IoinValue5   = IO_Input[4];
-        dpram_.Cmd_Dpram().IoinValue6   = IO_Input[5];
+        dpram_.Cmd_Dpram().IoinValue5   = IO_Input[4];        dpram_.Cmd_Dpram().IoinValue6   = IO_Input[5];
         dpram_.Cmd_Dpram().IoinValue7   = IO_Input[6];
         dpram_.Cmd_Dpram().IoinValue8   = IO_Input[7];
     }
@@ -1899,8 +1996,7 @@ namespace amc
         OHT_LOGT1("Model_SPEED_GRADE_7_VELOCITY : %f",Model_SPEED_GRADE_7_VELOCITY / Model_PULSETOMM);
         OHT_LOGT1("Model_SPEED_GRADE_8_VELOCITY : %f",Model_SPEED_GRADE_8_VELOCITY / Model_PULSETOMM);
 
-        OHT_LOGT1("OBS_SENSOR_VEL_LONG : %f",OBS_SENSOR_VEL_LONG / Model_PULSETOMM);
-        OHT_LOGT1("OBS_SENSOR_VEL_MIDDLE : %f",OBS_SENSOR_VEL_MIDDLE / Model_PULSETOMM);
+        OHT_LOGT1("OBS_SENSOR_VEL_LONG : %f",OBS_SENSOR_VEL_LONG / Model_PULSETOMM);        OHT_LOGT1("OBS_SENSOR_VEL_MIDDLE : %f",OBS_SENSOR_VEL_MIDDLE / Model_PULSETOMM);
 
         OHT_LOGT1("STOP_MOTION_DCC_HIGH : %f",STOP_MOTION_DCC_HIGH / Model_PULSETOMM);
         OHT_LOGT1("STOP_MOTION_DCC_LOW : %f",STOP_MOTION_DCC_LOW / Model_PULSETOMM);
@@ -2899,8 +2995,7 @@ namespace amc
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //Function Name   : SetIOCount
 //Target System   : OHT
-//Brief           : Service Request No : 189
-//Author          : Seungwan An
+//Brief           : Service Request No : 189//Author          : Seungwan An
 //Date            : 2017.11.13
 ////////////////////////////////////////////////////////////////////////////////////////////////////
     void Amc4OHT::SetIOCount()

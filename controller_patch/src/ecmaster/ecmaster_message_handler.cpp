@@ -148,6 +148,7 @@ namespace sephi
                 res.res.servo_module_num = slave.module_num;
                 res.res.servo_vendor = slave.vendor_id;
                 res.res.slave_type = slave.type;
+                res.res.product_code = slave.product_code;
 
                 SEP_LOGI("slave %d is allocated to %d!\n", slave.slave_id, slave.user_pid );
             } else {
@@ -190,42 +191,72 @@ namespace sephi
     bool EcMasterSvc::handleSdoMessage(const ECatSdoMsg& msg)
     {
         ECatSdoMsg res(static_cast<ECatSdoMsg::Command>(msg.command + msg.RESPONSE), msg.slave_id);
+        if (msg.slave_id < 0 || msg.slave_id >= static_cast<int32_t>(slaves_.size())) {
+            SEP_LOGE("SDO request invalid slave=%d", msg.slave_id);
+            return false;
+        }
         auto& slave = slaves_[msg.slave_id];
-        int32_t index;
-
-        index = msg.sdo.index;   //CISmulti
-	    
-        int sdo_offset = 0x800;
-	    if (slave.vendor_id == ecvendor_rsa){
-	        if (msg.sdo.index >= 0x2000 && msg.sdo.index < 0x3000)
-		        sdo_offset = 0x1000;
-	    }
-
-        index = msg.sdo.index + slave.module_num * sdo_offset;
+        res.result = -1;
+        if (msg.sdo.length == 0 || msg.sdo.length > sizeof(msg.sdo.data)) {
+            SEP_LOGE("SDO invalid transfer length: slave=%d len=%u capacity=%zu",
+                     msg.slave_id, msg.sdo.length, sizeof(msg.sdo.data));
+            slave.msgq->put(res);
+            return false;
+        }
+        int32_t index = msg.sdo.index;
+        const bool rsa_quad = (slave.vendor_id == ecvendor_rsa &&
+                               slave.product_code == 0x02020033);
+        if (msg.sdo.absolute_index == 1) {
+            // Opt-in for maintenance only. Ordinary legacy PDO/SDO consumers retain
+            // the original module offset calculation without any behavior change.
+            const bool pack_level = (index == 0x100A || index == 0x1010);
+            const bool axis_level = (index >= 0x2000 && index < 0x6000 &&
+                 (static_cast<int>(index >> 12) - 2) == slave.module_num);
+            if (!rsa_quad || (!pack_level && !axis_level)) {
+                SEP_LOGE("SDO absolute index rejected: slave=%d vendor=0x%x product=0x%x module=%d index=0x%x",
+                         msg.slave_id, slave.vendor_id, slave.product_code, slave.module_num, index);
+                slave.msgq->put(res);
+                return false;
+            }
+        } else {
+            // Existing RSA 2+1+1/Yaskawa/LS module rules are NOT modified.
+            int sdo_offset = 0x800;
+            if (slave.vendor_id == ecvendor_rsa &&
+                msg.sdo.index >= 0x2000 && msg.sdo.index < 0x3000)
+                sdo_offset = 0x1000;
+            index += slave.module_num * sdo_offset;
+        }
 
         if (msg.command == ECatSdoMsg::SDO_DOWNLOAD) {
-            EC_T_DWORD data = ecatCoeSdoDownloadEx(slave.bus_index, index, msg.sdo.subindex,
-                                 (uint8_t *)&msg.sdo.data, msg.sdo.length, msg.sdo.timeout, 0);
-
-            if (EC_E_NOERROR == data) {
+            const EC_T_DWORD error = ecatCoeSdoDownloadEx(
+                slave.bus_index, index, msg.sdo.subindex,
+                (uint8_t *)&msg.sdo.data, msg.sdo.length, msg.sdo.timeout, 0);
+            if (error == EC_E_NOERROR) {
                 res.result = 0;
             } else {
-                SEP_LOGE("Fail to download sdo to slave %d: index = 0x%x, sub=%d\n", msg.slave_id, index, msg.sdo.subindex);
-                res.result = -1;
+                SEP_LOGE("SDO download failed slave=%d bus=%d module=%d src=0x%x tx=0x%x sub=%u len=%u code=0x%x",
+                         msg.slave_id, slave.bus_index, slave.module_num, msg.sdo.index,
+                         index, msg.sdo.subindex, msg.sdo.length, error);
             }
-
         } else if (msg.command == ECatSdoMsg::SDO_UPLOAD) {
-            EcDWord outlen;
-            if (EC_E_NOERROR == ecatCoeSdoUploadEx(slave.bus_index, index, msg.sdo.subindex,
-                                                 (uint8_t *)&res.sdo.data, msg.sdo.length, &outlen, msg.sdo.timeout, 0)){
-                res.sdo.length = (uint16_t)outlen;
+            EcDWord outlen = 0;
+            const EC_T_DWORD error = ecatCoeSdoUploadEx(
+                slave.bus_index, index, msg.sdo.subindex,
+                (uint8_t *)&res.sdo.data, msg.sdo.length, &outlen, msg.sdo.timeout, 0);
+            if (error == EC_E_NOERROR && outlen > 0 && outlen <= sizeof(res.sdo.data)
+                && outlen <= msg.sdo.length) {
+                res.sdo.length = static_cast<uint16_t>(outlen);
+                // Mark successful CoE read (res.result aliases sdo.timeout).
+                res.result = 0;
             } else {
-                SEP_LOGE("Fail to upload sdo to slave %d\n", msg.slave_id);
+                SEP_LOGE("SDO upload failed slave=%d bus=%d module=%d src=0x%x tx=0x%x sub=%u requested=%u received=%u code=0x%x",
+                         msg.slave_id, slave.bus_index, slave.module_num, msg.sdo.index,
+                         index, msg.sdo.subindex, msg.sdo.length, outlen, error);
                 res.result = -1;
             }
-
         } else {
-            SEP_LOGE("Code should not reach here.\n");
+            SEP_LOGE("Unexpected SDO command=%u", msg.command);
+            slave.msgq->put(res);
             return false;
         }
         slave.msgq->put(res);

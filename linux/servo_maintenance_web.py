@@ -294,7 +294,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><title>Servo Maintenance</title>
 <style>
 body{font-family:Segoe UI,Arial,sans-serif;max-width:760px;margin:28px auto;padding:0 16px;color:#1f2937}
-h1{margin-bottom:4px}.note{color:#4b5563;margin-top:0}.panel{border:1px solid #d1d5db;border-radius:8px;padding:16px;margin:14px 0}
+.panel{border:1px solid #d1d5db;border-radius:8px;padding:16px;margin:14px 0}
 button{padding:8px 12px;margin:4px 4px 4px 0;cursor:pointer}select,input{padding:7px;margin:4px 0}#result{white-space:pre-wrap;background:#111827;color:#e5e7eb;padding:12px;border-radius:6px;min-height:110px;overflow:auto}
 .danger{background:#b91c1c;color:white;border:0}.warn{background:#b45309;color:white;border:0}
 </style></head><body>

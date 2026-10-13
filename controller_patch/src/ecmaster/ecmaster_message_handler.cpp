@@ -1,0 +1,466 @@
+/*
+ * SEMES CONFIDENTIAL
+ *
+ * Copyright (c) 2017 SEMES Co.,Ltd.
+ * All Rights Reserved.
+ *
+ * NOTICE: All information contained herein is, and remains the property
+ * of SEMES and its suppliers, if any. The intellectual and technical concepts
+ * contained herein are proprietary to SEMES and its suppliers and may be
+ * covered by S.Korea and Foreign Patents, patents in process, and are
+ * protected by trade secret or copyright law.
+ * Dissemination of this information or reproduction of this material is
+ * strictly forbidden unless prior written permission is obtained from SEMES.
+ */
+//
+// Created by master on 17. 4. 13.
+//
+#include "emul/ecat_emulator.h"
+#include "ecmaster_service.h"
+#include <fstream>
+#include <iterator>
+#include <sys/stat.h>
+#include <limits.h>
+#include <strings.h>
+#include <vector>
+
+
+namespace sephi
+{
+
+    static bool checkIfUserAlive(pid_t userpid)
+    {
+        char buff[32];
+        snprintf(buff, sizeof(buff), "/proc/%d", userpid);
+        return access(buff, R_OK) == 0;
+    }
+
+    static void doPrintHex(const char*msg, const void* data, int len) {
+        uint8_t *u8 = (uint8_t*)data;
+        printf("[[ %s ]]\n", msg);
+        for(int i = 0; i < len; i++) {
+            if (i>0 && i%4 == 0) printf(" ");
+            printf("%02x ", u8[i]);
+        }
+        printf("\n");
+    }
+
+    static void printHex(const char*msg, const void* data, int len) {
+#if STK_IO_LOG_ENABLE
+        doPrintHex(msg,data,len);
+#endif
+    }
+
+
+    bool EcMasterSvc::readOhtFrontInData(OhtFrontIoPdoIn &in)
+    {
+        SEP_REQUIRE_RET(oht_front_io_ != nullptr, false);
+        memcpy(&in, in_pdo+oht_front_io_->in_pd_offset, sizeof(in));
+
+        return true;
+    }
+
+    bool EcMasterSvc::readOhtRearInData(OhtRearIoPdoIn &in)
+    {
+        SEP_REQUIRE_RET(oht_rear_io_ != nullptr, false);
+        memcpy(&in, in_pdo+oht_rear_io_->in_pd_offset, sizeof(in));
+
+        return true;
+    }
+
+    bool EcMasterSvc::readOhtFrontOutData(OhtFrontIoPdoOut &out)
+    {
+        SEP_REQUIRE_RET(oht_front_io_ != nullptr, false);
+        memcpy(&out, shm_->address + EM_SHM_SECTION_SIZE + oht_front_io_->out_pd_offset, sizeof(out));
+
+        return true;
+    }
+
+    bool EcMasterSvc::readOhtRearOutData(OhtRearIoPdoOut &out)
+    {
+        SEP_REQUIRE_RET(oht_rear_io_ != nullptr, false);
+        memcpy(&out, shm_->address + EM_SHM_SECTION_SIZE + oht_rear_io_->out_pd_offset, sizeof(out));
+
+        return true;
+    }
+
+    bool EcMasterSvc::writeOhtFrontOutData(const OhtFrontIoPdoOut &out)
+    {
+        SEP_REQUIRE_RET(oht_front_io_ != nullptr, false);
+
+        memcpy(shm_->address + EM_SHM_SECTION_SIZE + oht_front_io_->out_pd_offset, &out, sizeof(out));
+        return true;
+    }
+
+    bool EcMasterSvc::writeOhtRearOutData(const OhtRearIoPdoOut &out)
+    {
+        SEP_REQUIRE_RET(oht_rear_io_ != nullptr, false);
+
+        memcpy(shm_->address + EM_SHM_SECTION_SIZE + oht_rear_io_->out_pd_offset, &out, sizeof(out));
+        return true;
+    }
+
+    bool EcMasterSvc::readStockerInData(StockerIoPdoIn &in)
+    {
+        SEP_REQUIRE_RET(stocker_io_ != nullptr, false);
+        //STK_IO_LOGT("readStockerInData\n");
+        memcpy(&in, in_pdo+stocker_io_->in_pd_offset, sizeof(in));
+
+        printHex("readStockerIn", &in, sizeof(in));
+        return true;
+    }
+    bool EcMasterSvc::readStockerOutData(StockerIoPdoOut &in)
+    {
+        SEP_REQUIRE_RET(stocker_io_ != nullptr, false);
+        //STK_IO_LOGT("readStockerOutData\n");
+        memcpy(&in, shm_->address + EM_SHM_SECTION_SIZE + stocker_io_->out_pd_offset, sizeof(in));
+        printHex("readStockerOut", &in, sizeof(in));
+        return true;
+    }
+
+    bool EcMasterSvc::writeStockerOutData(const StockerIoPdoOut &out)
+    {
+        SEP_REQUIRE_RET(stocker_io_ != nullptr, false);
+        STK_IO_LOGT("writeStockerOutData\n");
+        memcpy(shm_->address + EM_SHM_SECTION_SIZE + stocker_io_->out_pd_offset, &out, sizeof(out));
+        printHex("writeStockerOut", &out, sizeof(out));
+        return true;
+    }
+
+    bool EcMasterSvc::handleRequestMessage(const ECatSdoMsg& msg, ECatSdoMsg &res)
+    {
+        res.command = msg.command + msg.RESPONSE;
+        res.slave_id = -1;
+
+        if (msg.slave_id >= 0 && msg.slave_id < slaves_.size()) {
+            auto& slave = slaves_[msg.slave_id];
+            if (slave.user_pid != 0 && !checkIfUserAlive(slave.user_pid)) { // collect zombie resource
+                SEP_LOGT("Collecting resource from zombie pid %d\n", slave.user_pid);
+                slave.user_pid = 0;
+            }
+            if (slave.user_pid == 0) {
+                slave.user_pid = msg.req.pid;
+                res.slave_id = msg.slave_id;
+                res.res.in_pd_offset = slave.in_pd_offset;
+                res.res.out_pd_offset = slave.out_pd_offset;
+                res.res.bus_cycle_us = opt_->dwBusCycleTimeUsec;
+                res.res.bus_index = slave.bus_index;
+                res.res.servo_module_num = slave.module_num;
+                res.res.servo_vendor = slave.vendor_id;
+                res.res.slave_type = slave.type;
+
+                SEP_LOGI("slave %d is allocated to %d!\n", slave.slave_id, slave.user_pid );
+            } else {
+                SEP_LOGE("requested slave id (%d) is already in use. \n", msg.slave_id);
+                return false;
+            }
+        } else {
+            SEP_LOGE("requested slave id (%d) range invalid. \n", msg.slave_id);
+            return false;
+        }
+        return true;
+
+    }
+
+    bool EcMasterSvc::handleReleaseMessage(const ECatSdoMsg& msg, ECatSdoMsg &res)
+    {
+        res.command = msg.command + msg.RESPONSE;
+        res.slave_id = -1;
+
+        if (msg.slave_id >= 0 && msg.slave_id < slaves_.size()) {
+            auto& slave = slaves_[msg.slave_id];
+            if (slave.user_pid == msg.req.pid) {
+                slave.user_pid = 0;
+                res.slave_id = msg.slave_id;
+                if (slave.context != -1) {
+                    servos_[slave.context].controlWord().command = Cia402ControlWord::QUICK_STOP;
+                }
+                SEP_LOGI("slave %d is released!\n", slave.slave_id);
+            } else {
+                SEP_LOGE("release slave id (%d) owner is different. owner pid=%d, your pid=%d\n", msg.slave_id, slave.user_pid, msg.req.pid);
+                return false;
+            }
+        } else {
+            SEP_LOGE("release slave id (%d) range invalid. \n", msg.slave_id);
+            return false;
+        }
+        return true;
+    }
+
+    bool EcMasterSvc::handleSdoMessage(const ECatSdoMsg& msg)
+    {
+        ECatSdoMsg res(static_cast<ECatSdoMsg::Command>(msg.command + msg.RESPONSE), msg.slave_id);
+        auto& slave = slaves_[msg.slave_id];
+        int32_t index;
+
+        index = msg.sdo.index;   //CISmulti
+	    
+        int sdo_offset = 0x800;
+	    if (slave.vendor_id == ecvendor_rsa){
+	        if (msg.sdo.index >= 0x2000 && msg.sdo.index < 0x3000)
+		        sdo_offset = 0x1000;
+	    }
+
+        index = msg.sdo.index + slave.module_num * sdo_offset;
+
+        if (msg.command == ECatSdoMsg::SDO_DOWNLOAD) {
+            EC_T_DWORD data = ecatCoeSdoDownloadEx(slave.bus_index, index, msg.sdo.subindex,
+                                 (uint8_t *)&msg.sdo.data, msg.sdo.length, msg.sdo.timeout, 0);
+
+            if (EC_E_NOERROR == data) {
+                res.result = 0;
+            } else {
+                SEP_LOGE("Fail to download sdo to slave %d: index = 0x%x, sub=%d\n", msg.slave_id, index, msg.sdo.subindex);
+                res.result = -1;
+            }
+
+        } else if (msg.command == ECatSdoMsg::SDO_UPLOAD) {
+            EcDWord outlen;
+            if (EC_E_NOERROR == ecatCoeSdoUploadEx(slave.bus_index, index, msg.sdo.subindex,
+                                                 (uint8_t *)&res.sdo.data, msg.sdo.length, &outlen, msg.sdo.timeout, 0)){
+                res.sdo.length = (uint16_t)outlen;
+            } else {
+                SEP_LOGE("Fail to upload sdo to slave %d\n", msg.slave_id);
+                res.result = -1;
+            }
+
+        } else {
+            SEP_LOGE("Code should not reach here.\n");
+            return false;
+        }
+        slave.msgq->put(res);
+        return true;
+    }
+
+    bool EcMasterSvc::handleFirmwareDownload(const ECatSdoMsg& msg)
+    {
+        ECatSdoMsg res(ECatSdoMsg::RESPONSE_FIRMWARE_DOWNLOAD, msg.slave_id);
+        res.result = -1;
+
+        if (msg.slave_id < 0 || msg.slave_id >= static_cast<int32_t>(slaves_.size())) {
+            SEP_LOGE("Firmware update axis is invalid: %d\n", msg.slave_id);
+            return false;
+        }
+        if (firmware_update_in_progress_) {
+            SEP_LOGE("Another firmware update is already running\n");
+            slaves_[msg.slave_id].msgq->put(res);
+            return false;
+        }
+
+        char real_path[PATH_MAX] = {0,};
+        if (realpath(msg.firmware.path, real_path) == nullptr) {
+            SEP_LOGE("Firmware file cannot be resolved: %s\n", msg.firmware.path);
+            slaves_[msg.slave_id].msgq->put(res);
+            return false;
+        }
+        const char allowed_dir[] = "/home/semes/work/bin/";
+        if (strncmp(real_path, allowed_dir, sizeof(allowed_dir) - 1) != 0) {
+            SEP_LOGE("Firmware file is outside work/bin: %s\n", real_path);
+            slaves_[msg.slave_id].msgq->put(res);
+            return false;
+        }
+        const char* filename = strrchr(real_path, '/');
+        filename = filename == nullptr ? real_path : filename + 1;
+        const size_t filename_len = strlen(filename);
+        if (filename_len < 5 || strcasecmp(filename + filename_len - 4, ".bin") != 0) {
+            SEP_LOGE("Firmware file extension is invalid: %s\n", filename);
+            slaves_[msg.slave_id].msgq->put(res);
+            return false;
+        }
+
+        struct stat file_stat = {};
+        const size_t max_firmware_size = 8U * 1024U * 1024U;
+        if (stat(real_path, &file_stat) != 0 || !S_ISREG(file_stat.st_mode)
+            || file_stat.st_size <= 0 || static_cast<size_t>(file_stat.st_size) > max_firmware_size) {
+            SEP_LOGE("Firmware file size/type is invalid: %s\n", real_path);
+            slaves_[msg.slave_id].msgq->put(res);
+            return false;
+        }
+
+        std::ifstream input(real_path, std::ios::binary);
+        std::vector<EC_T_BYTE> firmware(
+            (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        if (!input.eof() || firmware.size() != static_cast<size_t>(file_stat.st_size)) {
+            SEP_LOGE("Firmware file read failed: %s\n", real_path);
+            slaves_[msg.slave_id].msgq->put(res);
+            return false;
+        }
+
+        auto& slave = slaves_[msg.slave_id];
+        const EC_T_DWORD acontis_slave_id = ecatGetSlaveId(slave.station_address);
+        if (acontis_slave_id == INVALID_SLAVE_ID) {
+            SEP_LOGE("Acontis slave ID lookup failed: station=%d\n", slave.station_address);
+            slave.msgq->put(res);
+            return false;
+        }
+
+        firmware_update_in_progress_ = true;
+        stopAllServo();
+        EC_T_DWORD error = emSetSlaveState(
+            INSTANCE_MASTER_DEFAULT, acontis_slave_id, DEVICE_STATE_INIT, 30000);
+        if (error == EC_E_NOERROR) {
+            error = emSetSlaveState(
+                INSTANCE_MASTER_DEFAULT, acontis_slave_id, DEVICE_STATE_BOOTSTRAP, 30000);
+        }
+        if (error == EC_E_NOERROR) {
+            const EC_T_DWORD timeout = msg.firmware.timeout_ms == 0 ? 900000 : msg.firmware.timeout_ms;
+            error = emFoeFileDownload(
+                INSTANCE_MASTER_DEFAULT,
+                acontis_slave_id,
+                const_cast<EC_T_CHAR*>(filename),
+                static_cast<EC_T_DWORD>(filename_len),
+                firmware.data(),
+                static_cast<EC_T_DWORD>(firmware.size()),
+                0x01020304,
+                timeout);
+        }
+
+        EC_T_DWORD restore_error = emSetSlaveState(
+            INSTANCE_MASTER_DEFAULT, acontis_slave_id, DEVICE_STATE_INIT, 30000);
+        if (error == EC_E_NOERROR && restore_error == EC_E_NOERROR) {
+            restore_error = emSetSlaveState(
+                INSTANCE_MASTER_DEFAULT, acontis_slave_id, DEVICE_STATE_PREOP, 30000);
+        }
+        if (error == EC_E_NOERROR && restore_error == EC_E_NOERROR) {
+            uint8_t reset_value = 1;
+            const uint16_t reset_index =
+                (slave.product_code == 0x02020013 || slave.product_code == 0x02020012)
+                ? 0x2c10 : 0x3010;
+            restore_error = ecatCoeSdoDownloadEx(
+                slave.bus_index, reset_index, 0, &reset_value, sizeof(reset_value), 30000, 0);
+            usleep(6000000);
+        }
+
+        const bool op_restored = changeECatState(eEcatState_OP);
+        firmware_update_in_progress_ = false;
+        recover_in_process_ = false;
+
+        if (error == EC_E_NOERROR && restore_error == EC_E_NOERROR && op_restored) {
+            res.result = 0;
+            SEP_LOGI("Firmware update completed: axis=%d station=%d file=%s\n",
+                msg.slave_id, slave.station_address, filename);
+        } else {
+            SEP_LOGE("Firmware update failed: axis=%d foe=0x%08lx restore=0x%08lx op=%d\n",
+                msg.slave_id, static_cast<unsigned long>(error),
+                static_cast<unsigned long>(restore_error), op_restored ? 1 : 0);
+        }
+        slave.msgq->put(res);
+        return res.result == 0;
+    }
+
+    bool EcMasterSvc::handleBitOpMessage(const ECatSdoMsg& msg)
+    {
+        ECatSdoMsg res(static_cast<ECatSdoMsg::Command>(msg.command + msg.RESPONSE), msg.slave_id);
+        auto& slave = slaves_[msg.slave_id];
+        auto& servo = servos_[slave.context];
+        if (msg.command == msg.CLEAR_BITS) {
+            servo.statusWord().ref() &= ~msg.word_bits;
+            SEP_LOGT("Clearing status 0x%x\n", msg.word_bits);
+        } else {
+            servo.statusWord().ref() |= msg.word_bits;
+            SEP_LOGT("Setting status 0x%x\n", msg.word_bits);
+        }
+        res.result = 0;
+        slave.msgq->put(res);
+        return true;
+    }
+
+
+    bool EcMasterSvc::handleSetMasterAxisMessage(const ECatSdoMsg &msg)
+    {
+        ECatSdoMsg res(static_cast<ECatSdoMsg::Command>(msg.command + msg.RESPONSE), msg.slave_id);
+        auto& slave = slaves_[msg.slave_id];
+
+        res.result = -1;
+
+        if (msg.master_axis < 0) {
+            SEP_LOGT("Unfollow axis %d\n", msg.slave_id);
+            slave.following_axis = -1;
+            auto& servo = servos_[slave.context];
+            servo.setVelocityTarget(0); // for stop axis
+            servo.setTorqueTarget(0);
+            res.result = 0;
+        } else if (msg.master_axis >= slaves_.size()) {
+            SEP_LOGE("Master Axis range (%d) is invalid!\n", msg.master_axis);
+        } else {
+            auto &sync_slave = slaves_[msg.master_axis];
+            if (slave.type != SlaveType::CIA402_COMPLIANT_SERVO_SINGLE
+            && slave.type != SlaveType::CIA402_COMPLIANT_SERVO_MULTI) {
+                SEP_LOGE("Slave %d is not servo drive\n", slave.slave_id);
+            } else if (sync_slave.type != SlaveType::CIA402_COMPLIANT_SERVO_SINGLE
+            && sync_slave.type != SlaveType::CIA402_COMPLIANT_SERVO_MULTI) { // yjchoe
+                SEP_LOGE("Master Slave %d is not servo drive\n", sync_slave.slave_id);
+            } else if (sync_slave.following_axis != -1) {
+                SEP_LOGE("Master Slave %d is following %d. Circulation is prevented.\n", sync_slave.slave_id, sync_slave.following_axis);
+            } else {
+                slave.following_axis = msg.master_axis;
+                SEP_LOGT("slave %d is following %d\n", slave.slave_id, slave.following_axis);
+                res.result = 0;
+            }
+        }
+        slave.msgq->put(res);
+        return true;
+    }
+
+    bool EcMasterSvc::handleMessages()
+    {
+        ECatSdoMsg msg;
+        bool ret;
+        while(true) {
+            if (!msgq_->get(msg, 1.0)) {
+                break;
+            }
+            ret = true; // by default
+            switch(msg.command) {
+                case ECatSdoMsg::RECOVER_OP_MODE:
+                    SEP_LOGT("handleMessages: ECMaster State change to OP\n");
+                    changeECatState(eEcatState_OP);
+                    ret = true;
+                    recover_in_process_ = false;
+                    break;
+                case ECatSdoMsg::CLEAR_BITS:/* fall through */
+                case ECatSdoMsg::SET_BITS:
+                    ret = handleBitOpMessage(msg);
+                    break;
+                /* 
+                case ECatSdoMsg::SET_MASTER_AXIS:    
+                    ret = handleSetMasterAxisMessage(msg);
+                    break;
+                */
+                case ECatSdoMsg::SDO_DOWNLOAD: /* fall through */
+                case ECatSdoMsg::SDO_UPLOAD: {
+#if 0 // async execution
+                    auto job = new AsyncJobHandle();
+                    *job =  std::async(std::launch::async, [this, &msg, &job](){
+                        SEP_LOGT("Async SDO job %p begins\n", job );
+                        bool result = handleSdoMessage(msg);
+                        ECatSdoMsg req(ECatSdoMsg::REMOVE_HANDLE); req.handle = job;
+                        msgq_->put(req);
+                        return result;
+                    });
+                    async_jobs_.insert(job);
+#else
+                    ret = handleSdoMessage(msg);
+#endif
+                    break;
+                }
+                case ECatSdoMsg::FIRMWARE_DOWNLOAD:
+                    ret = handleFirmwareDownload(msg);
+                    break;
+                case ECatSdoMsg::REMOVE_HANDLE: {
+                    auto job = (AsyncJobHandle*)msg.handle;
+                    SEP_LOGT("Async SDO job %p erased\n", job );
+                    async_jobs_.erase(job);
+                    delete job;
+                    break;
+                }
+                default:
+                    SEP_LOGE("Unexpected sdo message command - %d\n ", msg.command);
+            }
+            if (!ret) {
+                SEP_LOGW("Fail to process sdo message command %d\n", msg.command);
+            }
+        }
+        return true;
+    }
+}

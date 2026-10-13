@@ -1,0 +1,14 @@
+[Unit]
+Description=Servo Maintenance Local Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=semes
+WorkingDirectory=/home/semes/work/bin/servo-maintenance
+ExecStart=/usr/bin/python3 /home/semes/work/bin/servo-maintenance/linux/servo_maintenance_tcp_bridge.py --config /home/semes/work/bin/servo-maintenance/linux/servo_maintenance.ini
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -18,6 +18,19 @@
 
 #include "axes_module.h"
 #include "ecmaster_task.h"
+#include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <sstream>
+#include <set>
+#include <string>
+#include <vector>
 
 #define TRAJ_LOG_ENABLE
 
@@ -346,6 +359,201 @@ namespace sephi
             //}
         }
         return rtn;
+    }
+
+
+    // RSA absolute encoder reset via CoE SDO.
+    // This command is permitted only while the axis is idle and Servo OFF.
+    bool SingleAxis::AbsoluteEncoderReset()
+    {
+        if (motors_.empty() || !motors_[0])
+            return false;
+        EcServoMotor* motor = motors_[0].get();
+        if (!motor->initialized_ || motor->servo_vendor != ecvendor_rsa ||
+            motion_ != nullptr || motor->isEnabled()) {
+            SEP_LOGE("[ServoMaintenance] ABS_RESET refused (servo ON, motion active, or not RSA)");
+            return false;
+        }
+
+        // RSA MultiS Driving: 0x2C0A / single-axis Hoist, Slide: 0x300A.
+        const uint16_t index = (motor->servo_type_ == MULTI_SERVO) ? 0x2C0A : 0x300A;
+        const uint8_t command = 1;
+        const bool ok = motor->coeSdoDownload(index, 0, &command, sizeof(command));
+        if (!ok)
+            SEP_LOGE("[ServoMaintenance] ABS_RESET SDO failed index=0x%04x", index);
+        return ok;
+    }
+
+    // Reads the existing servo-tool CSV: name,param,index,subindex,type,value.
+    // Pre-parse the WHOLE file before any SDO write to reject malformed input.
+    bool SingleAxis::UpdateServoParameter(const char* filename, bool rsa_quad_4axis)
+    {
+        if (motors_.empty() || !motors_[0] || filename == nullptr || !*filename)
+            return false;
+        EcServoMotor* motor = motors_[0].get();
+        if (!motor->initialized_ || motor->servo_vendor != ecvendor_rsa ||
+            motion_ != nullptr || motor->isEnabled()) {
+            SEP_LOGE("[ServoMaintenance] PARAM_UPDATE refused (servo ON, motion active, or not RSA)");
+            return false;
+        }
+
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            SEP_LOGE("[ServoMaintenance] PARAM_UPDATE cannot open: %s", filename);
+            return false;
+        }
+
+        struct ParameterEntry {
+            uint16_t index;
+            uint16_t subindex;
+            std::vector<uint8_t> bytes;
+        };
+        std::vector<ParameterEntry> entries;
+        std::set<uint32_t> seen_addresses;
+        std::string line;
+        unsigned int line_no = 0;
+
+        const auto trim = [](std::string& value) {
+            const std::string::size_type first = value.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos) { value.clear(); return; }
+            const std::string::size_type last = value.find_last_not_of(" \t\r\n");
+            value = value.substr(first, last - first + 1);
+        };
+
+        while (std::getline(file, line)) {
+            ++line_no;
+            trim(line);
+            if (line.empty() || line[0] == '#')
+                continue;
+
+            std::string fields[6];
+            std::istringstream iss(line);
+            for (int n = 0; n < 6; ++n) {
+                if (!std::getline(iss, fields[n], ',')) {
+                    SEP_LOGE("[ServoMaintenance] PARAM_UPDATE malformed line=%u", line_no);
+                    return false;
+                }
+                trim(fields[n]);
+            }
+            std::string extra;
+            if (std::getline(iss, extra, ',')) {
+                SEP_LOGE("[ServoMaintenance] PARAM_UPDATE extra column line=%u", line_no);
+                return false;
+            }
+
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long raw_index = std::strtoul(fields[2].c_str(), &end, 0);
+            if (errno || end == fields[2].c_str() || *end || raw_index > 0xFFFF) {
+                SEP_LOGE("[ServoMaintenance] PARAM_UPDATE invalid index line=%u", line_no);
+                return false;
+            }
+            // RSA 4-axis maintenance input uses absolute 0x2/3/4/5xxx
+            // addressing.  Never send another module's parameter to this axis.
+            if (rsa_quad_4axis) {
+                const uint16_t prefix = static_cast<uint16_t>(0x2000 + motor->module_num * 0x1000);
+                if (raw_index < prefix || raw_index >= prefix + 0x1000)
+                    continue;
+            }
+            unsigned long raw_subindex = 0;
+            if (fields[3] != "-") {
+                errno = 0;
+                const int sub_base = fields[3].compare(0, 2, "0x") == 0 ? 16 : 10;
+                raw_subindex = std::strtoul(fields[3].c_str(), &end, sub_base);
+                if (errno || end == fields[3].c_str() || *end || raw_subindex > 255) {
+                    SEP_LOGE("[ServoMaintenance] PARAM_UPDATE invalid subindex line=%u", line_no);
+                    return false;
+                }
+            }
+
+            int width = 0;
+            bool is_signed = false;
+            if      (fields[4] == "USINT") width = 1;
+            else if (fields[4] == "SINT")  { width = 1; is_signed = true; }
+            else if (fields[4] == "UINT")  width = 2;
+            else if (fields[4] == "INT")   { width = 2; is_signed = true; }
+            else if (fields[4] == "UDINT") width = 4;
+            else if (fields[4] == "DINT")  { width = 4; is_signed = true; }
+            else {
+                SEP_LOGE("[ServoMaintenance] PARAM_UPDATE unsupported type line=%u", line_no);
+                return false;
+            }
+
+            errno = 0;
+            const long long parsed = std::strtoll(fields[5].c_str(), &end, 0);
+            if (errno || end == fields[5].c_str() || *end) {
+                SEP_LOGE("[ServoMaintenance] PARAM_UPDATE invalid value line=%u", line_no);
+                return false;
+            }
+            const long long bits = width * 8;
+            const long long lower = is_signed ? -(1LL << (bits - 1)) : 0;
+            const long long upper = is_signed ? ((1LL << (bits - 1)) - 1) : ((1LL << bits) - 1);
+            if (parsed < lower || parsed > upper) {
+                SEP_LOGE("[ServoMaintenance] PARAM_UPDATE out-of-range value line=%u", line_no);
+                return false;
+            }
+
+            ParameterEntry entry;
+            entry.index = static_cast<uint16_t>(raw_index);
+            entry.subindex = static_cast<uint16_t>(raw_subindex);
+            entry.bytes.resize(static_cast<size_t>(width));
+            const uint32_t encoded = static_cast<uint32_t>(parsed);
+            for (int i = 0; i < width; ++i)
+                entry.bytes[static_cast<size_t>(i)] = static_cast<uint8_t>(encoded >> (i * 8));
+            if (rsa_quad_4axis) {
+                const uint32_t address = (static_cast<uint32_t>(entry.index) << 8) | entry.subindex;
+                if (!seen_addresses.insert(address).second)
+                    continue;
+            }
+            entries.push_back(entry);
+        }
+
+        if (file.bad() || entries.empty()) {
+            SEP_LOGE("[ServoMaintenance] PARAM_UPDATE empty/unreadable file");
+            return false;
+        }
+
+        // RSA integrated 4-axis pack: validate actual data types BEFORE any write.
+        // Existing 2+1+1 parameter update semantics remain untouched.
+        if (rsa_quad_4axis) {
+            for (size_t i = 0; i < entries.size(); ++i) {
+                const ParameterEntry& entry = entries[i];
+                uint8_t probe[4] = {};
+                const int received = motor->coeSdoUpload(entry.index, entry.subindex,
+                                                          probe, sizeof(probe), true);
+                if (received != static_cast<int>(entry.bytes.size())) {
+                    SEP_LOGE("[ServoMaintenance] PARAM_UPDATE preflight SDO size mismatch index=0x%04x sub=%u expected=%zu received=%d",
+                             entry.index, entry.subindex, entry.bytes.size(), received);
+                    return false;
+                }
+            }
+        }
+        // The servo-tool's indexes already contain the RSA 0x2xxx/0x3xxx address.
+        // Do not add a second module offset to them.
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const ParameterEntry& entry = entries[i];
+            if (!motor->coeSdoDownload(entry.index, entry.subindex,
+                                       entry.bytes.data(), static_cast<int>(entry.bytes.size()), rsa_quad_4axis)) {
+                SEP_LOGE("[ServoMaintenance] PARAM_UPDATE write failed index=0x%04x sub=%u",
+                         entry.index, entry.subindex);
+                return false;
+            }
+            std::vector<uint8_t> readback(entry.bytes.size(), 0);
+            const int received = motor->coeSdoUpload(entry.index, entry.subindex,
+                                                      readback.data(), static_cast<int>(readback.size()), rsa_quad_4axis);
+            if (received != static_cast<int>(entry.bytes.size()) || readback != entry.bytes) {
+                SEP_LOGE("[ServoMaintenance] PARAM_UPDATE readback mismatch index=0x%04x sub=%u",
+                         entry.index, entry.subindex);
+                return false;
+            }
+        }
+
+        // Save manufacturer parameters only after every write/readback succeeds.
+        const uint8_t save[4] = {'s', 'a', 'v', 'e'};
+        const bool saved = motor->coeSdoDownload(0x1010, 0x04, save, sizeof(save), rsa_quad_4axis);
+        if (!saved)
+            SEP_LOGE("[ServoMaintenance] PARAM_UPDATE save (0x1010:04) failed");
+        return saved;
     }
 
     void SingleAxis::stayReference()
@@ -789,8 +997,7 @@ namespace sephi
         return true;
     }
 
-    bool SingleAxis::stop(double dec, int emergent)
-    {
+    bool SingleAxis::stop(double dec, int emergent)    {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!motors_[0]->isEnabled()) { /*SINGLE_AX_LOG("%s\n", "motor is not enabled!");*/ return false;}
         if (motion_ != nullptr && motion_->isInStopMotion()) { /*SINGLE_AX_LOG("%s", "Already in Stop motion.\n");*/ }

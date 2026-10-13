@@ -151,7 +151,8 @@ class MaintenanceBridge:
     def handle_request(self, header, payload, peer_ip):
         request_id = next(self._operation_ids)
         # Log only validated operation metadata, not tokens, confirmation, file content.
-        operation = header.get("command") if header.get("command") in AMC_COMMANDS else "unknown"
+        raw_command = header.get("command")
+        operation = raw_command if isinstance(raw_command, str) and raw_command in AMC_COMMANDS else "unknown"
         started = time.monotonic()
         try:
             self._validate(header, payload, peer_ip)

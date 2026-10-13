@@ -43,6 +43,7 @@ namespace  sephi
               initialized_(false), enabled_(false), emulation_mode_(ECAT_EMULATION_MODE), enc_offset_(0)
     {
         servo_vendor = 0;
+        product_code = 0;
         servo_type_ = 0;
     }
 
@@ -95,6 +96,7 @@ namespace  sephi
             servo_type_ = res.slave_type;
             servo_vendor = res.servo_vendor;
             module_num = res.servo_module_num;
+            product_code = res.product_code;
             
             SEP_LOGI("Servo Slave Info:  [axis_%d] vendor=%d\t type:%d\t bus_index:%d\t module_num:%d\n",axis, servo_vendor, servo_type_,bus_index,module_num);
             
@@ -177,13 +179,18 @@ namespace  sephi
     }
 
 
-    int EcServoMotor::coeSdoUpload(uint16_t index, uint16_t subindex, uint8_t* val, int len)
+    int EcServoMotor::coeSdoUpload(uint16_t index, uint16_t subindex, uint8_t* val, int len, bool absolute_index)
     {
         if (emulation_mode_) {
             throw std::runtime_error("SDO upload is not supported under Emulation mode");
         }
 
+        if (!val || len <= 0 || static_cast<size_t>(len) > EM_MSG_Q_DATA_SIZE) {
+            SEP_LOGE("[ServoMaintenance] Invalid SDO Upload buffer len=%d", len);
+            return -1;
+        }
         ECatSdoMsg msg(ECatSdoMsg::SDO_UPLOAD, axis_no_);
+        msg.sdo.absolute_index = absolute_index ? 1 : 0;
         msg.sdo.index = index;
         msg.sdo.subindex = subindex;
         msg.sdo.length  = len;
@@ -195,17 +202,27 @@ namespace  sephi
         SEP_REQUIRE_RET(msg_recvq_->get(res), -1);
         SEP_REQUIRE_RET(res.command == res.RESPONSE_SDO_UPLOAD, -1);
         SEP_REQUIRE_RET(res.result != -1, -1);
-
+        if (res.sdo.length == 0 || res.sdo.length > static_cast<uint16_t>(len)
+            || res.sdo.length > sizeof(res.sdo.data)) {
+            SEP_LOGE("[ServoMaintenance] Invalid SDO Upload response len=%u capacity=%d",
+                     res.sdo.length, len);
+            return -1;
+        }
         memcpy(val, res.sdo.data, res.sdo.length);
         return res.sdo.length;
     }
 
-    bool EcServoMotor::coeSdoDownload(uint16_t index, uint16_t subindex, const uint8_t *val, int len)
+    bool EcServoMotor::coeSdoDownload(uint16_t index, uint16_t subindex, const uint8_t *val, int len, bool absolute_index)
     {
         if (emulation_mode_) {
             throw std::runtime_error("SDO download is not supported under Emulation mode");
         }
+        if (!val || len <= 0 || static_cast<size_t>(len) > EM_MSG_Q_DATA_SIZE) {
+            SEP_LOGE("[ServoMaintenance] Invalid SDO Download buffer len=%d", len);
+            return false;
+        }
         ECatSdoMsg msg(ECatSdoMsg::SDO_DOWNLOAD, axis_no_);
+        msg.sdo.absolute_index = absolute_index ? 1 : 0;
         msg.sdo.index = index;
         msg.sdo.subindex = subindex;
         msg.sdo.length  = len;

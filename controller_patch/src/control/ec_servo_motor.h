@@ -123,6 +123,7 @@ namespace  sephi
         int servo_vendor;
         int bus_index;
         int module_num;
+        uint32_t product_code;
         int32_t enc_offset_;
 
         // status 관리
@@ -137,8 +138,8 @@ namespace  sephi
         bool disableStatus;  // 210806 yjchoe, add disable flag
     public:
         // mail box 통신
-        int coeSdoUpload(uint16_t index, uint16_t subindex, uint8_t* val, int len);
-        bool coeSdoDownload(uint16_t index, uint16_t subindex, const uint8_t *val, int len);
+        int coeSdoUpload(uint16_t index, uint16_t subindex, uint8_t* val, int len, bool absolute_index = false);
+        bool coeSdoDownload(uint16_t index, uint16_t subindex, const uint8_t *val, int len, bool absolute_index = false);
         friend class RoboticModule;
     };
 

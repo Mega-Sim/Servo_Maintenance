@@ -6,7 +6,15 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def source(name):
-    return (ROOT / name).read_text()
+    candidate = ROOT / name
+    if candidate.exists():
+        return candidate.read_text()
+    # GitHub publishes the controller changes as a diff; after applying it
+    # to a local controller tree, the exact sources are available under src/.
+    patch = ROOT / 'changes/0006-rsa-pack-profile-sdo-safety.diff'
+    if patch.exists():
+        return patch.read_text()
+    raise IOError('Neither source nor incremental patch was found: ' + name)
 
 
 class MaintenanceProfileStaticTest(unittest.TestCase):

@@ -242,8 +242,9 @@ class MaintenanceRequestHandler(BaseHTTPRequestHandler):
     ):
         # Do not log file contents, browser confirmation text or shared tokens.
         started = time.monotonic()
+        safe_target = target if target in ("driving", "hoist", "slide") else ("invalid" if target else "-")
         LOG.info("WEB_START cmd=%s axis=%s target=%s bytes=%d peer=%s",
-                 command, axis, target or "-", len(payload), self.client_address[0])
+                 command, axis, safe_target, len(payload), self.client_address[0])
         try:
             response = self.server.application.request(
                 command, axis, payload, filename, target, confirmation

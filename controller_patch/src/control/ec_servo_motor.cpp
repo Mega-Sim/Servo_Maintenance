@@ -98,7 +98,8 @@ namespace  sephi
             module_num = res.servo_module_num;
             product_code = res.product_code;
             
-            SEP_LOGI("Servo Slave Info:  [axis_%d] vendor=%d\t type:%d\t bus_index:%d\t module_num:%d\n",axis, servo_vendor, servo_type_,bus_index,module_num);
+            SEP_LOGI("Servo Slave Info: [axis_%d] vendor=%d type=%d bus_index=%d module_num=%d product=0x%x\n",
+                     axis, servo_vendor, servo_type_, bus_index, module_num, product_code);
             
 
             // channel creation
@@ -196,11 +197,21 @@ namespace  sephi
         msg.sdo.length  = len;
 
         std::lock_guard<std::mutex> guard(msgq_mtx_);
-        SEP_REQUIRE_RET(getSendQ()->put(msg), -1);
+        const bool queued = getSendQ()->put(msg);
+        if (!queued)
+            SEP_LOGE("[SMT] AMC_SDO_QUEUE_FAIL op=upload axis=%d index=0x%04x sub=%u", axis_no_, index, subindex);
+        SEP_REQUIRE_RET(queued, -1);
 
         ECatSdoMsg res;
-        SEP_REQUIRE_RET(msg_recvq_->get(res), -1);
+        const bool received = msg_recvq_->get(res);
+        if (!received)
+            SEP_LOGE("[SMT] AMC_SDO_REPLY_TIMEOUT op=upload axis=%d index=0x%04x sub=%u", axis_no_, index, subindex);
+        SEP_REQUIRE_RET(received, -1);
+        if (res.command != res.RESPONSE_SDO_UPLOAD)
+            SEP_LOGE("[SMT] AMC_SDO_REPLY_BAD_CMD op=upload axis=%d index=0x%04x got=%d", axis_no_, index, res.command);
         SEP_REQUIRE_RET(res.command == res.RESPONSE_SDO_UPLOAD, -1);
+        if (res.result == -1)
+            SEP_LOGE("[SMT] AMC_SDO_RESULT_FAIL op=upload axis=%d index=0x%04x sub=%u absolute=%d", axis_no_, index, subindex, absolute_index ? 1 : 0);
         SEP_REQUIRE_RET(res.result != -1, -1);
         if (res.sdo.length == 0 || res.sdo.length > static_cast<uint16_t>(len)
             || res.sdo.length > sizeof(res.sdo.data)) {
@@ -229,11 +240,21 @@ namespace  sephi
         memcpy(msg.sdo.data, val, len);
 
         std::lock_guard<std::mutex> guard(msgq_mtx_);
-        SEP_REQUIRE_RET(getSendQ()->put(msg), false);
+        const bool queued = getSendQ()->put(msg);
+        if (!queued)
+            SEP_LOGE("[SMT] AMC_SDO_QUEUE_FAIL op=download axis=%d index=0x%04x sub=%u", axis_no_, index, subindex);
+        SEP_REQUIRE_RET(queued, false);
 
         ECatSdoMsg res;
-        SEP_REQUIRE_RET(msg_recvq_->get(res), false);
+        const bool received = msg_recvq_->get(res);
+        if (!received)
+            SEP_LOGE("[SMT] AMC_SDO_REPLY_TIMEOUT op=download axis=%d index=0x%04x sub=%u", axis_no_, index, subindex);
+        SEP_REQUIRE_RET(received, false);
+        if (res.command != res.RESPONSE_SDO_DOWNLOAD)
+            SEP_LOGE("[SMT] AMC_SDO_REPLY_BAD_CMD op=download axis=%d index=0x%04x got=%d", axis_no_, index, res.command);
         SEP_REQUIRE_RET(res.command == res.RESPONSE_SDO_DOWNLOAD, false);
+        if (res.result == -1)
+            SEP_LOGE("[SMT] AMC_SDO_RESULT_FAIL op=download axis=%d index=0x%04x sub=%u absolute=%d", axis_no_, index, subindex, absolute_index ? 1 : 0);
         return res.result != -1;
     }
 

@@ -79,3 +79,7 @@ index = msg.sdo.index + slave.module_num * sdo_offset;
 
 원본 사용자 제공 자료: `IPC_HTML_UI.png`, `amc_lob.txt`, `ecmaster_lob.txt`, `parameter.txt`.
 이 공개 저장소에는 **로그 원문 전체 및 화면 캡처 전체**를 싣지 않음(라이선스 키·로컬 PC 바탕화면 등의 식별 가능한 정보 노출 방지). 재현 가능한 비민감 로그 인용과 파라미터 구조 통계를 옆 파일에 포함.
+
+## 추가로 확인된 소스상 판정 버그: PARAM_READ의 실패 은폐
+
+`linux/servo_maintenance_tcp_bridge.py`의 `AMC_COMMANDS`는 `parameter_read: ("PARAM_READ {axis} {path}", "PARAM_READ Axis=")`로 성공 접두어를 판정함. 하지만 AMC `src/app/amc/amc_oht.cpp`는 각 SDO가 실패해도 출력 행에 `READ_FAIL`을 붙이고 **항상** 맨 앞에 `PARAM_READ Axis={axis}`를 내보냄. 따라서 **일부/전체 파라미터가 읽기 실패해도 Bridge가 `ok=true`로 판정할 수 있음**. 행별 성공/실패 집계 및 전체 성공 기준을 재정의해야 함.

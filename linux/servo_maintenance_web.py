@@ -4,9 +4,12 @@
 import argparse
 import configparser
 import json
+import logging
 import re
 import socketserver
 import sys
+import time
+from logging.handlers import RotatingFileHandler
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -23,6 +26,8 @@ from common.maintenance_protocol import (  # noqa: E402
     TransportError,
 )
 
+
+LOG = logging.getLogger("servo_maintenance_web")
 
 PLACEHOLDER_TOKENS = ("", "CHANGE_ME", "CHANGE_ME_TO_A_LONG_RANDOM_TOKEN")
 FORM_OVERHEAD_BYTES = 64 * 1024  # multipart headers and small text fields
@@ -175,6 +180,7 @@ class MaintenanceRequestHandler(BaseHTTPRequestHandler):
             try:
                 axis = parse_axis(parse_qs(url.query).get("axis", [None])[0])
             except ValueError as error:
+                LOG.warning("WEB_BAD_AXIS peer=%s error=%s", self.client_address[0], error)
                 self._send_json(400, {"ok": False, "message": "invalid request: {}".format(error)})
                 return
             self._run_command("firmware_version", axis)
@@ -197,6 +203,7 @@ class MaintenanceRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"ok": False, "message": "not found"})
                 return
         except ValueError as error:
+            LOG.warning("WEB_BAD_REQUEST path=%s peer=%s error=%s", path, self.client_address[0], error)
             self._send_json(400, {"ok": False, "message": "invalid request: {}".format(error)}, plain_text)
             return
         self._run_command(plain_text=plain_text, **request)
@@ -233,16 +240,29 @@ class MaintenanceRequestHandler(BaseHTTPRequestHandler):
     def _run_command(
         self, command, axis=-1, payload=b"", filename="", target="", confirmation="", plain_text=False
     ):
+        # Do not log file contents, browser confirmation text or shared tokens.
+        started = time.monotonic()
+        LOG.info("WEB_START cmd=%s axis=%s target=%s bytes=%d peer=%s",
+                 command, axis, target or "-", len(payload), self.client_address[0])
         try:
             response = self.server.application.request(
                 command, axis, payload, filename, target, confirmation
             )
         except ValueError as error:
+            LOG.warning("WEB_REJECT cmd=%s axis=%s elapsed_ms=%.1f reason=%s",
+                        command, axis, (time.monotonic() - started) * 1000, error)
             self._send_json(400, {"ok": False, "message": "invalid request: {}".format(error)}, plain_text)
         except TransportError as error:
+            LOG.error("WEB_BRIDGE_FAIL cmd=%s axis=%s elapsed_ms=%.1f error_type=%s",
+                      command, axis, (time.monotonic() - started) * 1000, type(error).__name__)
             message = "Linux bridge communication failed: {}".format(error)
             self._send_json(502, {"ok": False, "message": message}, plain_text)
         else:
+            LOG.log(logging.INFO if response.get("ok") else logging.WARNING,
+                    "WEB_END cmd=%s axis=%s ok=%s elapsed_ms=%.1f response_bytes=%d",
+                    command, axis, bool(response.get("ok")),
+                    (time.monotonic() - started) * 1000,
+                    len(response.get("message", "").encode("utf-8", "replace")))
             self._send_json(200 if response.get("ok") else 409, response, plain_text)
 
     def _read_body(self, limit):
@@ -258,6 +278,7 @@ class MaintenanceRequestHandler(BaseHTTPRequestHandler):
         allowed = self.server.application.config.allowed_browser_ip
         if allowed in ("", "*", self.client_address[0]):
             return True
+        LOG.warning("WEB_IP_REJECT peer=%s", self.client_address[0])
         self._send_json(403, {"ok": False, "message": "browser IP is not allowed"})
         return False
 
@@ -266,6 +287,7 @@ class MaintenanceRequestHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if not origin or origin == "http://" + self.headers.get("Host", ""):
             return True  # IE does not send Origin for same-site requests.
+        LOG.warning("WEB_ORIGIN_REJECT peer=%s", self.client_address[0])
         self._send_json(403, {"ok": False, "message": "cross-site request is not allowed"})
         return False
 
@@ -286,7 +308,7 @@ class MaintenanceRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def log_message(self, format_string, *args):
-        # The UI stays quiet; operation results are shown in the browser.
+        # No full URL, query, or headers in logs (avoids sensitive values).
         return
 
 
@@ -320,23 +342,48 @@ window.onload=function(){run('/api/status')};
 def serve(config):
     server = MaintenanceHTTPServer((config.web_host, config.web_port), MaintenanceApplication(config))
     try:
-        print("Servo Maintenance UI: http://{}:{}/".format(config.web_host, config.web_port))
+        LOG.info("WEB_LISTEN host=%s port=%d bridge=%s:%d",
+                 config.web_host, config.web_port, config.motion_ip, config.tcp_port)
+        if config.allowed_browser_ip in ("", "*"):
+            LOG.warning("WEB_ACCESS_UNRESTRICTED: allowed_browser_ip is not restricted")
         server.serve_forever(poll_interval=0.5)
     finally:
         server.server_close()
 
 
+def setup_logging():
+    """Console + bounded persistent file logs. Do not prevent startup if disk is read-only."""
+    if LOG.handlers:
+        return
+    LOG.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(formatter)
+    LOG.addHandler(console)
+    try:
+        logs = PACKAGE_ROOT / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        rotating = RotatingFileHandler(
+            str(logs / "servo_maintenance_web.log"), maxBytes=2 * 1024 * 1024,
+            backupCount=3, encoding="utf-8")
+        rotating.setFormatter(formatter)
+        LOG.addHandler(rotating)
+    except OSError as error:
+        LOG.warning("WEB_LOG_FILE_UNAVAILABLE error_type=%s", type(error).__name__)
+
+
 def main():
+    setup_logging()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(Path(__file__).with_name("servo_maintenance.ini")))
     args = parser.parse_args()
     try:
         serve(load_web_config(args.config))
     except (ValueError, OSError) as error:
-        print("Cannot start Servo Maintenance web UI: {}".format(error), file=sys.stderr)
+        LOG.error("WEB_STARTUP_FAIL error=%s", error)
         return 2
     except KeyboardInterrupt:
-        pass
+        LOG.info("WEB_STOP")
     return 0
 
 

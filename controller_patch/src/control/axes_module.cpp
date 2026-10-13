@@ -997,7 +997,8 @@ namespace sephi
         return true;
     }
 
-    bool SingleAxis::stop(double dec, int emergent)    {
+    bool SingleAxis::stop(double dec, int emergent)
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!motors_[0]->isEnabled()) { /*SINGLE_AX_LOG("%s\n", "motor is not enabled!");*/ return false;}
         if (motion_ != nullptr && motion_->isInStopMotion()) { /*SINGLE_AX_LOG("%s", "Already in Stop motion.\n");*/ }

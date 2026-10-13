@@ -27,6 +27,8 @@
 #include <sstream>
 #include <set>
 #include <thread>
+#include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 
@@ -174,33 +176,56 @@ namespace amc
         std::thread([this]()
         {
             const char* path = "/tmp/amc_rsa_maintenance.sock";
-            unlink(path);
+            if (unlink(path) < 0 && errno != ENOENT)
+                SEP_LOGE("[SMT] AMC_SOCKET_UNLINK_FAIL errno=%d", errno);
 
             int server = socket(AF_UNIX, SOCK_STREAM, 0);
-            if (server < 0)
+            if (server < 0) {
+                SEP_LOGE("[SMT] AMC_SOCKET_CREATE_FAIL errno=%d", errno);
                 return;
+            }
 
             sockaddr_un addr = {};
             addr.sun_family = AF_UNIX;
             strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
             if (bind(server, (sockaddr*)&addr, sizeof(addr)) < 0) {
+                SEP_LOGE("[SMT] AMC_SOCKET_BIND_FAIL errno=%d", errno);
                 close(server);
                 return;
             }
 
-            chmod(path, 0600);
-            listen(server, 1);
+            if (chmod(path, 0600) < 0) {
+                SEP_LOGE("[SMT] AMC_SOCKET_CHMOD_FAIL errno=%d", errno);
+                close(server);
+                unlink(path);
+                return;
+            }
+            if (listen(server, 1) < 0) {
+                SEP_LOGE("[SMT] AMC_SOCKET_LISTEN_FAIL errno=%d", errno);
+                close(server);
+                unlink(path);
+                return;
+            }
+            SEP_LOGI("[SMT] AMC_SOCKET_READY path=%s", path);
+            unsigned long long request_sequence = 0;
 
             while (true)
             {
                 int client = accept(server, nullptr, nullptr);
-                if (client < 0)
+                if (client < 0) {
+                    if (errno != EINTR) {
+                        SEP_LOGE("[SMT] AMC_SOCKET_ACCEPT_FAIL errno=%d", errno);
+                        usleep(100000); // prevent failure log flooding
+                    }
                     continue;
+                }
 
                 char buf[1024] = {};
                 int len = recv(client, buf, sizeof(buf) - 1, 0);
                 if (len <= 0) {
+                    SEP_LOGE("[SMT] AMC_SOCKET_RECV_FAIL received=%d errno=%d", len,
+                             len < 0 ? errno : 0);
                     close(client);
                     continue;
                 }
@@ -216,6 +241,8 @@ namespace amc
                 std::getline(iss, filename);
                 if (!filename.empty() && filename[0] == ' ')
                     filename.erase(0, 1);
+                const unsigned long long request_id = ++request_sequence;
+                const auto request_started = std::chrono::steady_clock::now();
 
                 auto valid_axis = [this](int axis)
                 {
@@ -287,8 +314,17 @@ namespace amc
                     }
                     if (len > 0 && version.empty())
                         version = "UNKNOWN";
+                    if (len <= 0)
+                        SEP_LOGE("[SMT] AMC_FW_SDO_FAIL axis=%d index=0x100A absolute=%d len=%d",
+                                 axis, quad ? 1 : 0, len);
                     return len > 0;
                 };
+
+                const bool axis_ok = valid_axis(axis);
+                SEP_LOGI("[SMT] AMC_START id=%llu cmd=%s axis=%d product=0x%x profile=%s",
+                         request_id, cmd.c_str(), axis,
+                         axis_ok ? motors[axis]->product_code : 0,
+                         axis_ok ? maintenance_model(axis) : "N/A");
 
                 if (cmd == "STATUS")
                 {
@@ -314,21 +350,28 @@ namespace amc
                 }
                 else if (!valid_axis(axis))
                 {
+                    SEP_LOGE("[SMT] AMC_AXIS_REJECT id=%llu cmd=%s axis=%d", request_id,
+                             cmd.c_str(), axis);
                     result = "ERROR INVALID_AXIS\n";
                 }
                 else if (motors[axis]->servo_vendor == ecvendor_mecapion ||
                          motors[axis]->servo_vendor == ecvendor_yaskawa)
                 {
                     // Vendor-specific maintenance commands will be implemented later.
+                    SEP_LOGE("[SMT] AMC_UNSUPPORTED_VENDOR id=%llu cmd=%s axis=%d profile=%s",
+                             request_id, cmd.c_str(), axis, maintenance_model(axis));
                     result = std::string("ERROR NOT_IMPLEMENTED ") + maintenance_model(axis) + "\n";
                 }
                 else if (motors[axis]->servo_vendor == ecvendor_rsa &&
                          !strcmp(maintenance_model(axis), "RSA_UNKNOWN_PRODUCT"))
                 {
+                    SEP_LOGE("[SMT] AMC_UNSUPPORTED_PRODUCT id=%llu axis=%d product=0x%x",
+                             request_id, axis, motors[axis]->product_code);
                     result = "ERROR UNSUPPORTED_RSA_PRODUCT\n";
                 }
                 else if (motors[axis]->servo_vendor != ecvendor_rsa)
                 {
+                    SEP_LOGE("[SMT] AMC_UNSUPPORTED_SERVO id=%llu axis=%d", request_id, axis);
                     result = "ERROR UNSUPPORTED_SERVO\n";
                 }
                 else if (cmd == "ABS_RESET")
@@ -352,14 +395,19 @@ namespace amc
                 {
                     FILE* fp = fopen(filename.c_str(), "r");
                     if (!fp) {
+                        SEP_LOGE("[SMT] AMC_PARAM_OPEN_FAIL id=%llu axis=%d errno=%d",
+                                 request_id, axis, errno);
                         result = "ERROR PARAM_FILE\n";
                     } else {
                         std::ostringstream out;
                         int total = 0, skipped = 0, succeeded = 0, failed = 0;
+                        unsigned int rows = 0;
+                        int failure_logs = 0;
                         std::set<uint32_t> seen;
                         char line[512];
                         const unsigned int wanted_group = static_cast<unsigned int>(2 + axis);
                         while (fgets(line, sizeof(line), fp)) {
+                            ++rows;
                             char* name = strtok(line, ",");
                             strtok(nullptr, ",");
                             char* idx = strtok(nullptr, ",");
@@ -367,12 +415,18 @@ namespace amc
                             char* type = strtok(nullptr, ", \r\n");
                             if (!name || !idx || !sub || !type) {
                                 ++failed;
+                                if (failure_logs++ < 10)
+                                    SEP_LOGE("[SMT] AMC_PARAM_PARSE_FAIL id=%llu row=%u reason=columns",
+                                             request_id, rows);
                                 continue;
                             }
                             char* end = nullptr;
                             const unsigned long raw_index = strtoul(idx, &end, 16);
                             if (end == idx || *end || raw_index > 0xffff) {
                                 ++failed;
+                                if (failure_logs++ < 10)
+                                    SEP_LOGE("[SMT] AMC_PARAM_PARSE_FAIL id=%llu row=%u reason=index",
+                                             request_id, rows);
                                 continue;
                             }
                             unsigned long raw_sub = 0;
@@ -380,6 +434,9 @@ namespace amc
                                 raw_sub = strtoul(sub, &end, 0);
                                 if (end == sub || *end || raw_sub > 255) {
                                     ++failed;
+                                    if (failure_logs++ < 10)
+                                        SEP_LOGE("[SMT] AMC_PARAM_PARSE_FAIL id=%llu row=%u reason=subindex",
+                                                 request_id, rows);
                                     continue;
                                 }
                             }
@@ -421,13 +478,29 @@ namespace amc
                                 // No silent truncation; preserve original type discrepancy.
                                 out << "TYPE_MISMATCH expected=" << expected << " received=" << len;
                                 ++failed;
+                                if (failure_logs++ < 10)
+                                    SEP_LOGE("[SMT] AMC_PARAM_TYPE_FAIL id=%llu row=%u axis=%d idx=0x%04x sub=%u expected=%d got=%d",
+                                             request_id, rows, axis, index, subindex, expected, len);
                             } else {
                                 out << "READ_FAIL";
                                 ++failed;
+                                if (failure_logs++ < 10)
+                                    SEP_LOGE("[SMT] AMC_PARAM_SDO_FAIL id=%llu row=%u axis=%d idx=0x%04x sub=%u",
+                                             request_id, rows, axis, index, subindex);
                             }
                             out << "\n";
                         }
+                        if (ferror(fp)) {
+                            SEP_LOGE("[SMT] AMC_PARAM_IO_FAIL id=%llu axis=%d rows=%u", request_id, axis, rows);
+                            ++failed;
+                        }
                         fclose(fp);
+                        SEP_LOGI("[SMT] AMC_PARAM_SUMMARY id=%llu axis=%d profile=%s rows=%u total=%d ok=%d fail=%d skip=%d",
+                                 request_id, axis, quad ? "RSA_4AXIS" : "RSA_LEGACY",
+                                 rows, total, succeeded, failed, skipped);
+                        if (failure_logs > 10)
+                            SEP_LOGE("[SMT] AMC_PARAM_ERRORS_SUPPRESSED id=%llu count=%d",
+                                     request_id, failure_logs - 10);
                         if (total == 0 && failed == 0)
                             result = "ERROR PARAM_AXIS_NO_ENTRIES\n";
                         else {
@@ -446,21 +519,28 @@ namespace amc
                     if (quad) {
                         // The whole 4-axis pack shares one physical EtherCAT slave.
                         // FoE package/target mapping requires separate validation.
+                        SEP_LOGE("[SMT] AMC_FOE_BLOCKED id=%llu reason=4axis_not_validated", request_id);
                         result = "ERROR FOE_4AXIS_NOT_VALIDATED\n";
                     } else if (axis == 1) {
+                        SEP_LOGE("[SMT] AMC_FOE_BLOCKED id=%llu reason=invalid_target axis=%d", request_id, axis);
                         result = "ERROR INVALID_FIRMWARE_TARGET\n";
                     } else if (filename.empty()) {
+                        SEP_LOGE("[SMT] AMC_FOE_BLOCKED id=%llu reason=empty_filename", request_id);
                         result = "ERROR FIRMWARE_FILE\n";
                     } else {
                         // Stop motion and turn every servo off before EC-Master touches the bus.
                         bool prepared = true;
                         for (int i = 0; i < TOTAL_AXIS_NUM; ++i) {
-                            if (!valid_axis(i) || !oht_[i]->prepareFirmwareUpdate())
+                            if (!valid_axis(i) || !oht_[i]->prepareFirmwareUpdate()) {
                                 prepared = false;
+                                SEP_LOGE("[SMT] AMC_FOE_PREPARE_FAIL id=%llu axis=%d", request_id, i);
+                            }
                         }
 
                         std::string version;
                         if (!prepared || !oht_[axis]->updateFirmware(filename.c_str(), 900000)) {
+                            SEP_LOGE("[SMT] AMC_FOE_RESULT id=%llu axis=%d ok=0 prepared=%d",
+                                     request_id, axis, prepared ? 1 : 0);
                             result = "ERROR FIRMWARE_UPDATE\n";
                         } else {
                             result = "OK FIRMWARE_UPDATE Axis=" + std::to_string(axis) + " File=" + filename;
@@ -471,11 +551,24 @@ namespace amc
                     }
                 }
 
+                const bool operation_ok = result.compare(0, 5, "ERROR") != 0;
+                const long long elapsed_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - request_started).count();
+                if (operation_ok)
+                    SEP_LOGI("[SMT] AMC_END id=%llu cmd=%s axis=%d ok=1 elapsed_ms=%lld bytes=%zu",
+                             request_id, cmd.c_str(), axis, elapsed_ms, result.size());
+                else
+                    SEP_LOGE("[SMT] AMC_END id=%llu cmd=%s axis=%d ok=0 elapsed_ms=%lld bytes=%zu",
+                             request_id, cmd.c_str(), axis, elapsed_ms, result.size());
                 size_t sent = 0;
                 while (sent < result.size()) {
                     ssize_t count = send(client, result.data() + sent, result.size() - sent, 0);
-                    if (count <= 0)
+                    if (count <= 0) {
+                        SEP_LOGE("[SMT] AMC_SOCKET_SEND_FAIL id=%llu sent=%zu expected=%zu errno=%d",
+                                 request_id, sent, result.size(), count < 0 ? errno : 0);
                         break;
+                    }
                     sent += static_cast<size_t>(count);
                 }
                 close(client);

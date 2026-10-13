@@ -1,7 +1,7 @@
 # Servo Maintenance RSA pack profile / SDO safety patch (0006)
 
 > 대상: `Mega-Sim/Servo_Maintenance` 브랜치 `claude/nice-dirac-q56uun`.
-> **전제:** 현장에 적용했던 `AbsoluteEncoderReset` / `UpdateServoParameter` 함수 정의까지 포함한 이전 수정 **10개 Controller 파일**이 먼저 적용되어 있어야 한다. 이 diff는 그 상태를 기준으로 작성된 **추가 변경분**이다.
+> **전제:** `0005`(FoE 등) → **`0005b`(AbsoluteEncoderReset/UpdateServoParameter 함수 누락 보완)** → **`0006`(제품 코드/4축 구분/SDO 보호)** 순으로 적용한다. 이미 현장에 `0005b`에 해당하는 두 함수가 반영되어 있으면 `0005b`를 다시 적용하지 않고 `0006`만 적용한다.
 
 ## 동작 범위
 
@@ -52,7 +52,7 @@ Service RPC 정의 자체는 바뀌지 않았기 때문에 기존 `ecmaster.grpc
 
 ## 적용 / 재빌드
 
-기존 빌드가 성공한 소스 트리(이전 10개 수정 파일 보유)를 백업한 뒤:
+기존 빌드가 성공한 소스 트리(이전 10개 수정 파일 보유)를 백업한 뒤, `0005b` 함수가 이미 들어간 트리라면 아래대로 `0006`만 적용한다:
 
 ```bash
 cd ~/work/master_control_19201

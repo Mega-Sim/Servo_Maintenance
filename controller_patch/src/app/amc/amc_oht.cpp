@@ -997,7 +997,8 @@ namespace amc
         dpram_.Cmd_Dpram().IoinValue2_1 = IO_Input[1];
         dpram_.Cmd_Dpram().IoinValue3   = IO_Input[2];
         dpram_.Cmd_Dpram().IoinValue4   = IO_Input[3];
-        dpram_.Cmd_Dpram().IoinValue5   = IO_Input[4];        dpram_.Cmd_Dpram().IoinValue6   = IO_Input[5];
+        dpram_.Cmd_Dpram().IoinValue5   = IO_Input[4];
+        dpram_.Cmd_Dpram().IoinValue6   = IO_Input[5];
         dpram_.Cmd_Dpram().IoinValue7   = IO_Input[6];
         dpram_.Cmd_Dpram().IoinValue8   = IO_Input[7];
     }
@@ -1996,7 +1997,8 @@ namespace amc
         OHT_LOGT1("Model_SPEED_GRADE_7_VELOCITY : %f",Model_SPEED_GRADE_7_VELOCITY / Model_PULSETOMM);
         OHT_LOGT1("Model_SPEED_GRADE_8_VELOCITY : %f",Model_SPEED_GRADE_8_VELOCITY / Model_PULSETOMM);
 
-        OHT_LOGT1("OBS_SENSOR_VEL_LONG : %f",OBS_SENSOR_VEL_LONG / Model_PULSETOMM);        OHT_LOGT1("OBS_SENSOR_VEL_MIDDLE : %f",OBS_SENSOR_VEL_MIDDLE / Model_PULSETOMM);
+        OHT_LOGT1("OBS_SENSOR_VEL_LONG : %f",OBS_SENSOR_VEL_LONG / Model_PULSETOMM);
+        OHT_LOGT1("OBS_SENSOR_VEL_MIDDLE : %f",OBS_SENSOR_VEL_MIDDLE / Model_PULSETOMM);
 
         OHT_LOGT1("STOP_MOTION_DCC_HIGH : %f",STOP_MOTION_DCC_HIGH / Model_PULSETOMM);
         OHT_LOGT1("STOP_MOTION_DCC_LOW : %f",STOP_MOTION_DCC_LOW / Model_PULSETOMM);
@@ -2995,7 +2997,8 @@ namespace amc
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //Function Name   : SetIOCount
 //Target System   : OHT
-//Brief           : Service Request No : 189//Author          : Seungwan An
+//Brief           : Service Request No : 189
+//Author          : Seungwan An
 //Date            : 2017.11.13
 ////////////////////////////////////////////////////////////////////////////////////////////////////
     void Amc4OHT::SetIOCount()

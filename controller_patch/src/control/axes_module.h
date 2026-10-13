@@ -132,6 +132,8 @@ namespace sephi
         bool resume();
         bool clearCommand();
         bool resetEncoder(bool soft=false);
+        bool AbsoluteEncoderReset();
+        bool UpdateServoParameter(const char* filename, bool rsa_quad_4axis = false);
         void setMotionChangeMode(bool immediate) { immediate_motion_change_ = immediate; }
         bool isImmediateChangeMode() {return immediate_motion_change_; }
 
